@@ -1,0 +1,1472 @@
+diff --git a/packages/client/runtime/README.i18n.yaml b/packages/client/runtime/README.i18n.yaml
+index cd46900b77..f641cda247 100644
+--- a/packages/client/runtime/README.i18n.yaml
++++ b/packages/client/runtime/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/client/runtime/README.md
+-README.md: 1fb91bc8ca1bf9beae0ea12632acd9572db58670
+-README.zh.md: 294a77d7081f5b475aca8b50f6c6d8322370375d
++README.md: 782662c2cfeaac3d7321a60e420a415e9d23f57f
++README.zh.md: ce1af6298d528e1a6a5920429c5eeebc031831bd
+diff --git a/packages/client/runtime/README.md b/packages/client/runtime/README.md
+index 1fb91bc8ca..782662c2cf 100644
+--- a/packages/client/runtime/README.md
++++ b/packages/client/runtime/README.md
+@@ -89,5 +89,5 @@ Changing the model selection can change or invalidate provider-side cache reuse;
+ ## Known Limitations and Deferred Work
+ 
+ - **`loader.unload` is a stub** — it throws not-implemented; the client has no unload chain from fiber disposal through registration and style removal.
+-- **Scope teardown is stage-driven, single-occupant today** — the staged session follows `list.current` exactly (staging is the open signal: the event window opens ⟺ the session is on stage); a removed-while-staged session's scope survives frozen until the stage moves on, not until true observer count reaches zero. Resolution (`binding()`/`scope()`) is pure addressing, render-safe; the render layer reads the current bundle through the `currentProvideInfo` observable. The staged state can widen to a multi-pane list when concurrent panes land.
++- **Secondary pane selection is transient** — `openInPane()` resolves and opens one listed Session without changing `list.current`, but reload does not restore that view, and the primary staged-session lifecycle remains the only persisted navigation state.
+ - **Value imports of this package from plugin bundles must use the `/client` subpath** — the bare package name is not in the loader externals table and inlines a second module instance, whose private scope-tag Symbol never matches.
+diff --git a/packages/client/runtime/README.zh.md b/packages/client/runtime/README.zh.md
+index 294a77d708..ce1af6298d 100644
+--- a/packages/client/runtime/README.zh.md
++++ b/packages/client/runtime/README.zh.md
+@@ -89,5 +89,5 @@ reason 为 `max-tokens` 的 `turn/end` 会在该轮位置投影出一个 `turn-m
+ ## 已知限制与暂缓事项
+ 
+ - **`loader.unload` 是 stub**：它会抛出 not-implemented；客户端没有从 fiber dispose 到注册与样式移除的卸载链。
+-- **scope 拆卸由阶段驱动，目前只能有一个占用者**：已 staged 的会话精确跟随 `list.current`（staging 就是打开信号：事件窗口打开 ⟺ 会话位于 stage）；在 staged 状态下被移除的会话，其 scope 会冻结保留，直到 stage 转向其他会话，而非直到真实观察者数量降为零。解析（`binding()`／`scope()`）只是纯寻址，可安全用于渲染；渲染层经 `currentProvideInfo` observable 读取当前 bundle。并发 pane 落地时，staged 状态可以扩展为多 pane 列表。
++- **第二窗格选择是瞬态的**：`openInPane()` 可在不改变 `list.current` 的前提下解析并打开一个已列出的 Session，但页面刷新不会恢复该视图，主 staged Session 的生命周期仍是唯一持久化的导航状态。
+ - **插件 bundle 从该包导入值时必须使用 `/client` 子路径**：裸包名不在 loader externals 表中，会内联第二个模块实例；其私有 scope-tag Symbol 永远无法匹配。
+diff --git a/packages/client/runtime/src/client/contract/sessions.ts b/packages/client/runtime/src/client/contract/sessions.ts
+index 27b9d2d13b..3c6177701e 100644
+--- a/packages/client/runtime/src/client/contract/sessions.ts
++++ b/packages/client/runtime/src/client/contract/sessions.ts
+@@ -127,4 +127,8 @@ export interface ISessions {
+    * @returns binding, or undefined for a session neither listed nor already scoped.
+    */
+   binding(id: SessionId): SessionBinding | undefined
++  /** Resolve the standard-kit bundle for an addressed session without changing selection. */
++  paneProvideInfo(id: SessionId): SessionMaybeProvideInfo
++  /** Open an addressed session's history window without changing selection. */
++  openInPane(id: SessionId): void
+ }
+diff --git a/packages/client/runtime/src/client/sessions/service.ts b/packages/client/runtime/src/client/sessions/service.ts
+index c66da4e0d3..45fd4fdc2e 100644
+--- a/packages/client/runtime/src/client/sessions/service.ts
++++ b/packages/client/runtime/src/client/sessions/service.ts
+@@ -578,22 +578,27 @@ export class SessionRuntime implements ISessions {
+   }
+ 
+   /**
+-   * Resolve one session's render-layer standard-props bundle (ctx never
+-   * enters the render layer; the renderer subscribes to
+-   * {@link SessionRuntime.currentProvideInfo}). Pure resolution — render-safe:
+-   * no staging, no window side effects (StrictMode double-invokes and
+-   * concurrent discarded passes must stay free).
++   * Resolve one session's render-layer standard-props bundle without changing
++   * the selected session. Missing ids return the static no-session kit so a
++   * nested pane preserves its hook roster while the row disappears.
++   * @param id - addressed session id.
++   * @returns the addressed bundle or the static no-session bundle.
+    */
+-  private provideInfo(id: string): SessionProvideInfo | undefined {
+-    return this.resolve(id as SessionId)?.provideInfo
++  paneProvideInfo(id: SessionId): SessionMaybeProvideInfo {
++    return this.scopes.get(id)?.provideInfo ?? this.provideChannel.maybeInfo
+   }
+ 
+-  /**
+-   * Resolve the current-session-optional standard kit. Unknown or absent ids
+-   * return the static no-session projection rather than removing hook props.
+-   */
++  /** Open an addressed session window without changing the primary selection. */
++  openInPane(id: SessionId): void {
++    const record = this.resolve(id)
++    if (record === undefined) throw new Error(`unknown session "${id}"`)
++    void record.session.open()
++    void this.manager.refreshSubagents(id)
++  }
++
++  /** Resolve the current session's standard kit. */
+   private maybeProvideInfo(id: string | undefined): SessionMaybeProvideInfo {
+-    return (id === undefined ? undefined : this.provideInfo(id)) ?? this.provideChannel.maybeInfo
++    return id === undefined ? this.provideChannel.maybeInfo : this.paneProvideInfo(id as SessionId)
+   }
+ 
+   /**
+diff --git a/packages/client/runtime/src/client/slots.ts b/packages/client/runtime/src/client/slots.ts
+index c5680afacf..a48b18b61a 100644
+--- a/packages/client/runtime/src/client/slots.ts
++++ b/packages/client/runtime/src/client/slots.ts
+@@ -412,6 +412,7 @@ export class SlotRegistry extends Service {
+       sessions: {
+         list: sessions.list,
+         provideInfo: sessions.currentProvideInfo,
++        resolveProvideInfo: sessionId => sessions.paneProvideInfo(sessionId as import('@deepseek-ai/dsh-api-remotes/client').SessionId),
+       },
+       workspaces: { list: workspaces.list },
+       get locale() { return service._locale },
+diff --git a/packages/client/ui-layout/README.i18n.yaml b/packages/client/ui-layout/README.i18n.yaml
+index d52d995ca1..591aa67d27 100644
+--- a/packages/client/ui-layout/README.i18n.yaml
++++ b/packages/client/ui-layout/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/client/ui-layout/README.md
+-README.md: 7c9d64b9ca7a5fada492c37200a283904466c36d
+-README.zh.md: a2604d865977c495d2a3d2362b25f05e34142c97
++README.md: 0a125c45c19f73c78a9ea6cb0704853d4af93b68
++README.zh.md: 31fff5249f4c6f445c68e1ddd21b56962aaac530
+diff --git a/packages/client/ui-layout/README.md b/packages/client/ui-layout/README.md
+index 7c9d64b9ca..0a125c45c1 100644
+--- a/packages/client/ui-layout/README.md
++++ b/packages/client/ui-layout/README.md
+@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
+ 
+ Shell plugin: three-column AppFrame (drag handles and concession chain) plus the `ctx.layout` panel-geometry service; it registers into the runtime-owned `root` slot and declares `sidebar`, `conversation`, `details`, and `conversation.empty`. The sidebar resize boundary is an invisible hit strip, while the details boundary retains its floating pill; only details shrinks during concession and then auto-closes. A closed sidebar retains a 56px control rail while details closes to zero width. The package also seats the theme presenter: it consumes resolved `ctx.theme` snapshots and projects them onto the document (`html { color-scheme }` for native UA chrome, `body[data-ds-dark-theme]` from the active color scheme, the theme's alias tokens as inline variables on body, and one owned `<meta name="theme-color">` whose content follows the computed body background). Measuring after palette and token application keeps the rendered background as the single color authority; disposing the presenter removes its metadata node with its other global writes.
+ 
+-AppFrame always mounts the conversation and details columns; a connected Session renders through `SessionProvider`. The transient layout store starts the sidebar at its default width and details closed, and it never reads or writes `localStorage`. Hero and other unselected states also derive a zero rendered details width without changing that stored preference. AppFrame retains the last non-blank Session id across those states: the first Session remains closed, an explicit details action opens the contract default width, returning to the same Session restores its unchanged width, and selecting a different Session closes details before paint. The conversation owner share is empty, while the sidebar owner share contains only `collapsed` and `width`; registrants obtain business data from standard hooks and actions from their own inject faces.
++AppFrame always mounts the conversation and details columns; a connected Session renders through `SessionProvider`. Its transient layout store starts the sidebar at its default width and details closed, and it never reads or writes `localStorage`. Selecting **Split session** from a sidebar Session menu asks `ctx.layout` to render that addressed Session in an equal-width secondary conversation pane; selecting the same menu item again or its close button removes the pane. The secondary pane binds to that Session's own object-layer bundle and is hidden below 920px. Hero and other unselected states also derive a zero rendered details width without changing that stored preference. AppFrame retains the last non-blank Session id across those states: the first Session remains closed, an explicit details action opens the contract default width, returning to the same Session restores its unchanged width, and selecting a different Session closes details before paint. The conversation owner share is empty, while the sidebar owner share contains only `collapsed` and `width`; registrants obtain business data from standard hooks and actions from their own inject faces.
+ 
+ The `/client` exports are the plugin body (`apply`/`inject`), `LayoutController`, and the four owner-share interfaces. AppFrame, the panel store, and the concession solver remain package-internal.
+ 
+@@ -18,6 +18,6 @@ None; this package neither assembles nor sends a provider request.
+ 
+ ## Known Limitations and Deferred Work
+ 
+-- **Panel geometry is transient** — reload restores the sidebar default and details closed; switching between distinct Session ids also closes details and forgets its dragged width, while unselected surfaces render details at zero width without modifying geometry.
++- **Panel geometry and the secondary Session are transient** — reload restores the sidebar default, details closed, and one conversation pane; switching between distinct primary Session ids also closes details and forgets its dragged width, while unselected surfaces render details at zero width without modifying geometry.
+ - **Concession-chain auto-close derives a zero width without touching the preferred width** — the panel restores itself when the window widens; consumers must not read the stored details width as the rendered truth.
+ - **No scroll anchoring during squeeze reflow** — layout changes may move the reader's viewport.
+diff --git a/packages/client/ui-layout/README.zh.md b/packages/client/ui-layout/README.zh.md
+index a2604d8659..31fff5249f 100644
+--- a/packages/client/ui-layout/README.zh.md
++++ b/packages/client/ui-layout/README.zh.md
+@@ -4,7 +4,7 @@
+ 
+ 外壳插件：三栏 AppFrame（拖动手柄与让步链）加 `ctx.layout` 面板几何服务；它注册到运行时拥有的 `root` slot，并声明 `sidebar`、`conversation`、`details` 和 `conversation.empty`。侧边栏的缩放边界是不可见命中条带，详情栏边界则保留其浮动胶囊；让步期间只有详情栏会收缩并随后自动关闭。关闭的侧边栏仍保留 56px 控制栏，详情栏则关闭到零宽度。该包还提供主题呈现器：它消费解析后的 `ctx.theme` 快照，并将其投影到 document（用 `html { color-scheme }` 驱动原生 UA 控件，依据当前配色方案设置 `body[data-ds-dark-theme]`，并将主题的别名 token 设为 body 上的内联变量，同时拥有一个 `<meta name="theme-color">`，其内容随计算后的 body 背景色更新）。在应用调色板和 token 后进行测量，可确保渲染后的背景成为唯一的颜色依据；呈现器在 dispose（资源释放）时会移除其自有的元数据节点，并一并清除其写入的其他全局状态。
+ 
+-AppFrame 始终挂载会话栏和详情栏；已连接 Session 通过 `SessionProvider` 渲染。布局 store 是瞬时状态，侧边栏以默认宽度启动，详情栏则保持关闭，且该 store 从不读写 `localStorage`。hero 和其他未选中状态也会将详情栏的渲染宽度派生为零，但不会改变存储的宽度偏好。AppFrame 会跨越这些状态保留最后一个非 blank 会话 id：首个会话保持关闭；显式打开详情栏的操作会使用约定默认宽度；返回同一会话时恢复其未改变的宽度；选择不同会话时，详情栏会在绘制前关闭。会话 owner share 为空，侧边栏 owner share 只包含 `collapsed` 和 `width`；注册方通过标准钩子获取业务数据，并从各自的 inject 接口获取操作。
++AppFrame 始终挂载会话栏和详情栏；已连接 Session 通过 `SessionProvider` 渲染。布局 store 是瞬时状态，侧边栏以默认宽度启动，详情栏保持关闭，且该 store 从不读写 `localStorage`。从侧边栏 Session 菜单选择“分屏会话”会通过 `ctx.layout` 将该 Session 渲染到等宽的第二个对话窗格；再次选择同一菜单项或点击关闭按钮会移除该窗格。第二个窗格绑定自身的对象层 Session bundle，920px 以下隐藏。hero 和其他未选中状态也会将详情栏的渲染宽度派生为零，但不会改变存储的宽度偏好。AppFrame 会跨越这些状态保留最后一个非 blank 会话 id：首个会话保持关闭；显式打开详情栏的操作会使用约定默认宽度；返回同一会话时恢复其未改变的宽度；选择不同会话时，详情栏会在绘制前关闭。会话 owner share 为空，侧边栏 owner share 只包含 `collapsed` 和 `width`；注册方通过标准钩子获取业务数据，并从各自的 inject 接口获取操作。
+ 
+ `/client` 导出表层包含插件主体（`apply`／`inject`）、`LayoutController` 和四个 owner-share 接口。AppFrame、面板 store 与让步求解器仍属于包内部。
+ 
+@@ -18,6 +18,6 @@ AppFrame 始终挂载会话栏和详情栏；已连接 Session 通过 `SessionPr
+ 
+ ## 已知限制与暂缓事项
+ 
+-- **面板几何信息是瞬时状态**：重新加载会恢复侧边栏默认值，并使详情栏保持关闭；在不同会话 id 之间切换同样会关闭详情栏，并忘记拖动后的宽度，而未选中表面会以零宽度渲染详情栏，但不会修改几何信息。
++- **面板几何和第二个 Session 都是瞬时的**：重新加载会恢复侧边栏默认值、关闭详情栏并回到单会话窗格；在不同主 Session id 之间切换同样会关闭详情栏，并忘记拖动后的宽度，而未选中表面会以零宽度渲染详情栏，但不会修改几何信息。
+ - **让步链自动关闭通过推导零宽度实现，不会改动宽度偏好**：窗口变宽时面板会自行恢复；消费方禁止把 store 中的详情宽度当作实际渲染状态。
+ - **挤压重排期间不提供滚动锚定**：布局变化可能移动读者的 viewport。
+diff --git a/packages/client/ui-layout/package.json b/packages/client/ui-layout/package.json
+index 8846fba95b..4cad0f46c2 100644
+--- a/packages/client/ui-layout/package.json
++++ b/packages/client/ui-layout/package.json
+@@ -33,6 +33,7 @@
+     "client": {
+       "inject": [
+         "@deepseek-ai/dsh-client-runtime",
++        "@deepseek-ai/dsh-client-locale",
+         "@deepseek-ai/dsh-client-ui-theme"
+       ],
+       "platform": "web"
+@@ -44,6 +45,7 @@
+   },
+   "license": "MIT",
+   "peerDependencies": {
++    "@deepseek-ai/dsh-client-locale": "workspace:^",
+     "@deepseek-ai/dsh-client-runtime": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-slots": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-theme": "workspace:^",
+diff --git a/packages/client/ui-layout/src/client/AppFrame.module.css b/packages/client/ui-layout/src/client/AppFrame.module.css
+index ae56780133..98dbcc37ec 100644
+--- a/packages/client/ui-layout/src/client/AppFrame.module.css
++++ b/packages/client/ui-layout/src/client/AppFrame.module.css
+@@ -32,10 +32,45 @@
+ .centerCol {
+   min-width: 0;
+   display: flex;
+-  flex-direction: column;
+   overflow: hidden;
+ }
+ 
++.conversationPane {
++  display: flex;
++  flex: 1 1 0;
++  min-width: 0;
++  overflow: hidden;
++}
++
++.conversationPane + .conversationPane {
++  border-left: 1px solid var(--dsw-alias-border-l2);
++}
++
++.conversationPane[data-conversation-pane='secondary'] {
++  position: relative;
++}
++
++.splitClose {
++  position: absolute;
++  z-index: 8;
++  top: 12px;
++  right: 12px;
++  width: 24px;
++  height: 24px;
++  padding: 0;
++  border: 1px solid var(--dsw-alias-border-l1);
++  border-radius: 6px;
++  color: var(--dsw-alias-label-secondary);
++  background: var(--dsw-alias-bg-layer-1);
++  font-size: 18px;
++  line-height: 20px;
++  cursor: pointer;
++}
++
++.splitClose:hover {
++  background: var(--dsw-alias-interactive-bg-hover);
++}
++
+ .detailsCol {
+   min-width: 0;
+   overflow: hidden;
+diff --git a/packages/client/ui-layout/src/client/AppFrame.tsx b/packages/client/ui-layout/src/client/AppFrame.tsx
+index 2696dc91fa..1e61ee7e94 100644
+--- a/packages/client/ui-layout/src/client/AppFrame.tsx
++++ b/packages/client/ui-layout/src/client/AppFrame.tsx
+@@ -12,7 +12,7 @@
+  */
+ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+ import type { ReactNode } from 'react'
+-import type { PropsRenderSlots, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
++import type { PropsLocale, PropsRenderSlots, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
+ import { computeColumns, SIDEBAR_AUTO_COLLAPSE, SIDEBAR_DEFAULT } from './columns.ts'
+ import type { createLayoutStore } from './stores.ts'
+ import css from './AppFrame.module.css'
+@@ -22,6 +22,7 @@ export type AppFrameProps =
+   & PropsRuntime<'root'>
+   & PropsRenderSlots<'sidebar' | 'conversation' | 'details' | 'shell.overlay'>
+   & PropsStore<ReturnType<typeof createLayoutStore>>
++  & PropsLocale<'layout'>
+ 
+ /** Center column grid item (session-body building block). */
+ function CenterColumn(props: { children?: ReactNode }) {
+@@ -89,6 +90,7 @@ export function AppFrame({
+   useSessions,
+   actions,
+   renderSlot,
++  t,
+ }: AppFrameProps) {
+   const panels = useStore(s => s)
+   const detailsSession = useSessions((s) => {
+@@ -140,6 +142,7 @@ export function AppFrame({
+     ? 0
+     : panels.sidebar === 0 ? SIDEBAR_DEFAULT : panels.sidebar
+   const cols = computeColumns(viewport, sidebarPreference, detailsSession === undefined ? 0 : panels.details)
++  const splitVisible = panels.splitSessionId !== undefined && viewport >= 920
+   const colsRef = useRef(cols)
+   colsRef.current = cols
+ 
+@@ -187,7 +190,25 @@ export function AppFrame({
+             the shell's own pending rendering. The conversation
+             is session-maybe; the strict details entry naturally renders
+             empty while no session is current. */}
+-        <CenterColumn>{renderSlot('conversation', {})}</CenterColumn>
++        <CenterColumn>
++          <div className={css.conversationPane} data-conversation-pane="primary">
++            {renderSlot('conversation', {})}
++          </div>
++          {splitVisible && panels.splitSessionId !== undefined && (
++            <div className={css.conversationPane} data-conversation-pane="secondary">
++              {renderSlot('conversation', {}, { sessionId: panels.splitSessionId })}
++              <button
++                type="button"
++                className={css.splitClose}
++                aria-label={t('split.close')}
++                title={t('split.close')}
++                onClick={actions.closeSplitSession}
++              >
++                ×
++              </button>
++            </div>
++          )}
++        </CenterColumn>
+         <DetailsColumn>{renderSlot('details', {})}</DetailsColumn>
+       </>
+       <div className={css.overlayLayer} data-shell-overlay>
+diff --git a/packages/client/ui-layout/src/client/index.ts b/packages/client/ui-layout/src/client/index.ts
+index c56d83bfbb..b589279fc3 100644
+--- a/packages/client/ui-layout/src/client/index.ts
++++ b/packages/client/ui-layout/src/client/index.ts
+@@ -8,12 +8,14 @@
+  * presenter, which projects ctx.theme snapshots onto document.body.
+  */
+ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
++import type {} from '@deepseek-ai/dsh-client-locale/client'
+ import type {} from '@deepseek-ai/dsh-client-ui-theme/client'
+ import type { PanelActions } from './service.ts'
+ import { AppFrame } from './AppFrame.tsx'
+ import { createLayoutStore } from './stores.ts'
+ import { LayoutController } from './service.ts'
+ import { ThemePresenter } from './theme-presenter.ts'
++import { en, NS, zh, type LayoutKey } from './locales.ts'
+ 
+ // Contract exports only (export-convergence rule: cross-package consumers
+ // keep a symbol exported; test-only/package-internal symbols live off /src).
+@@ -31,6 +33,11 @@ declare module '@deepseek-ai/cordis' {
+ }
+ 
+ declare module '@deepseek-ai/dsh-client-ui-slots' {
++  interface LocaleNamespaceMap {
++    /** Layout shell controls. */
++    layout: LayoutKey
++  }
++
+   interface SlotMap {
+     // The 'root' entry itself is the runtime's built-in slot (declared
+     // there); these four are the frame's children, declared by the same
+@@ -105,7 +112,7 @@ export interface ConvOwnerProps {}
+ export interface DetailsOwnerProps {}
+ 
+ /** Required services (cordis fiber inject — the loader passes all module exports as an object plugin). */
+-export const inject = ['slots', 'theme']
++export const inject = ['slots', 'theme', 'locale']
+ 
+ /**
+  * Client plugin body: provide ctx.layout, then one register() call — AppFrame
+@@ -114,6 +121,7 @@ export const inject = ['slots', 'theme']
+  * @param ctx - client root context.
+  */
+ export function apply(ctx: ClientContext): void {
++  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-layout: dictionaries')
+   const layout = new LayoutController()
+   ctx.effect(() => {
+     const disposeService = ctx.reflect.provide('layout', layout)
+@@ -130,6 +138,7 @@ export function apply(ctx: ClientContext): void {
+       store: createLayoutStore,
+       // The hook's only side effect connects the root store to ctx.layout;
+       // conversation business actions belong to their registrants.
++      locale: NS,
+       inject: (actions: PanelActions) => {
+         layout.attachPanels(actions)
+         return {}
+diff --git a/packages/client/ui-layout/src/client/service.ts b/packages/client/ui-layout/src/client/service.ts
+index 2b2e50e5d5..c36a5b5cdb 100644
+--- a/packages/client/ui-layout/src/client/service.ts
++++ b/packages/client/ui-layout/src/client/service.ts
+@@ -8,6 +8,7 @@
+  * details open/close from ui-conversation) — writes stay inside the store's
+  * declared action set, delivered as the registration's bound actions.
+  */
++import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
+ import type { BoundActions } from '@deepseek-ai/dsh-client-ui-slots'
+ import type { createLayoutStore } from './stores.ts'
+ 
+@@ -25,6 +26,10 @@ export interface ILayout {
+   toggleSidebar(): void
+   /** Open the details panel (no-op when already open). */
+   openDetails(): void
++  /** Render one addressed session in the fixed secondary conversation pane. */
++  splitSession(sessionId: SessionId): void
++  /** Close the fixed secondary conversation pane. */
++  closeSplitSession(): void
+   /** Close the details panel. */
+   closeDetails(): void
+ }
+@@ -54,6 +59,16 @@ export class LayoutController implements ILayout {
+     this.#require().openDetails()
+   }
+ 
++  /** Render one addressed session in the fixed secondary conversation pane. */
++  splitSession(sessionId: SessionId): void {
++    this.#require().setSplitSession(sessionId)
++  }
++
++  /** Close the fixed secondary conversation pane. */
++  closeSplitSession(): void {
++    this.#require().closeSplitSession()
++  }
++
+   /** Close the details panel. */
+   closeDetails(): void {
+     this.#require().closeDetails()
+diff --git a/packages/client/ui-layout/src/client/stores.ts b/packages/client/ui-layout/src/client/stores.ts
+index d2de668a9c..93a2037686 100644
+--- a/packages/client/ui-layout/src/client/stores.ts
++++ b/packages/client/ui-layout/src/client/stores.ts
+@@ -7,6 +7,7 @@
+  * derives its PropsStore share from the return type, and the service face
+  * receives the bound actions through the registration's inject hook.
+  */
++import type { SessionId } from '@deepseek-ai/dsh-api-remotes/client'
+ import { defineStore, type EngineStoreHandle } from '@deepseek-ai/dsh-client-runtime/client'
+ import {
+   clampWidth, DETAILS_DEFAULT, DETAILS_MAX, DETAILS_MIN,
+@@ -20,7 +21,13 @@ import {
+  * `narrowExpanded` is the manual override that re-expands the auto-collapsed
+  * sidebar over the squeezed center without rewriting the width preference.
+  */
+-type LayoutState = { sidebar: number; details: number; narrow: boolean; narrowExpanded: boolean }
++type LayoutState = {
++  sidebar: number
++  details: number
++  splitSessionId: SessionId | undefined
++  narrow: boolean
++  narrowExpanded: boolean
++}
+ 
+ /**
+  * Annotation twin of the actions literal below (the export needs a declared
+@@ -29,6 +36,8 @@ type LayoutState = { sidebar: number; details: number; narrow: boolean; narrowEx
+ type LayoutActions = {
+   setSidebar: (draft: LayoutState, px: number) => void
+   setDetails: (draft: LayoutState, px: number) => void
++  setSplitSession: (draft: LayoutState, sessionId: SessionId) => void
++  closeSplitSession: (draft: LayoutState) => void
+   toggleSidebar: (draft: LayoutState) => void
+   setNarrow: (draft: LayoutState, narrow: boolean) => void
+   openDetails: (draft: LayoutState) => void
+@@ -47,10 +56,20 @@ type LayoutActions = {
+  */
+ export function createLayoutStore(): EngineStoreHandle<LayoutState, LayoutActions>  {
+   const handle = defineStore({
+-    init: (): LayoutState => ({ sidebar: SIDEBAR_DEFAULT, details: 0, narrow: false, narrowExpanded: false }),
++    init: (): LayoutState => ({
++      sidebar: SIDEBAR_DEFAULT,
++      details: 0,
++      splitSessionId: undefined,
++      narrow: false,
++      narrowExpanded: false,
++    }),
+     actions: {
+       setSidebar: (d, px: number) => { d.sidebar = clampWidth(px, SIDEBAR_MIN, SIDEBAR_MAX) },
+       setDetails: (d, px: number) => { d.details = clampWidth(px, DETAILS_MIN, DETAILS_MAX) },
++      setSplitSession: (d, sessionId: SessionId) => {
++        d.splitSessionId = d.splitSessionId === sessionId ? undefined : sessionId
++      },
++      closeSplitSession: (d) => { d.splitSessionId = undefined },
+       // Narrow toggles flip only the override: the width preference survives
+       // untouched, so re-widening restores the pre-squeeze layout.
+       toggleSidebar: (d) => {
+diff --git a/packages/client/ui-layout/tests/app-frame.client.spec.tsx b/packages/client/ui-layout/tests/app-frame.client.spec.tsx
+index 65de5a640e..8a55d5f1d8 100644
+--- a/packages/client/ui-layout/tests/app-frame.client.spec.tsx
++++ b/packages/client/ui-layout/tests/app-frame.client.spec.tsx
+@@ -55,9 +55,9 @@ function hookOf<T>(inst: { subscribe: (fn: () => void) => () => void; getSnapsho
+ function mountFrame() {
+   window.innerWidth = frameWidth // first-render viewport source before the observer fires
+   const instance = createLayoutStore().create()
+-  const slotCalls: { key: string; props: unknown }[] = []
+-  const renderSlot = ((key: string, owner: object) => {
+-    slotCalls.push({ key, props: owner })
++  const slotCalls: { key: string; props: unknown; sessionId: string | undefined }[] = []
++  const renderSlot = ((key: string, owner: object, opts?: { sessionId?: string }) => {
++    slotCalls.push({ key, props: owner, sessionId: opts?.sessionId })
+     if (key === 'sidebar') return <div data-testid="sidebar-content" />
+     if (key === 'conversation') return <div data-testid="center-content" />
+     if (key === 'details') return <div data-testid="details-content" />
+@@ -88,6 +88,7 @@ function mountFrame() {
+       useSessions={useSessions}
+       useWorkspaces={((sel: (s: WorkspaceListState) => unknown) => sel(workspaceState)) as never}
+       SessionProvider={SessionProviderStub}
++      t={((key: string) => key === 'split.close' ? 'Close split session' : key) as never}
+     />
+   )
+   const utils = render(element())
+@@ -163,6 +164,14 @@ describe('AppFrame', () => {
+     expect(slotCalls.map(c => c.key)).toContain('conversation')
+   })
+ 
++  it('mounts a primary and addressed secondary conversation when split is enabled', () => {
++    const { instance, slotCalls } = mountFrame()
++    act(() => { instance.actions.setSplitSession('s-secondary' as SessionId) })
++    const panes = slotCalls.filter(call => call.key === 'conversation').slice(-2)
++    expect(panes.map(call => call.props)).toEqual([{}, {}])
++    expect(panes[1]?.sessionId).toBe('s-secondary')
++  })
++
+   it('renders both column occupants before baselines settle (no loading gate)', () => {
+     // No loading gate: a bare loading status reads worse than the shell's own
+     // pending rendering — both occupants mount from first paint.
+diff --git a/packages/client/ui-layout/tests/apply.client.spec.ts b/packages/client/ui-layout/tests/apply.client.spec.ts
+index 95f8cad439..15927721d2 100644
+--- a/packages/client/ui-layout/tests/apply.client.spec.ts
++++ b/packages/client/ui-layout/tests/apply.client.spec.ts
+@@ -30,6 +30,7 @@ async function bench() {
+   // ui-theme's Appearance row binds a durable scope through these two.
+   ctx.provide('remote', { $on: () => () => {} } as never)
+   ctx.provide('settingsScope', { bind: () => stubSettingsScope().scope } as never)
++  ctx.provide('sessions', {} as never)
+   await ctx.plugin({ inject: themeInject, apply: themeApply }).await()
+   await slotsFiber.await()
+   return { ctx, slots: ctx.get('slots') as SlotRegistry }
+@@ -37,7 +38,7 @@ async function bench() {
+ 
+ describe('ui-layout client apply', () => {
+   it('declares its service dependencies', () => {
+-    expect(inject).toEqual(['slots', 'theme'])
++    expect(inject).toEqual(['slots', 'theme', 'locale'])
+   })
+ 
+   it('provides ctx.layout and registers AppFrame into root with the three child declarations', async () => {
+@@ -58,7 +59,7 @@ describe('ui-layout client apply', () => {
+     const fiber = ctx.plugin({ inject: [...inject], apply })
+     await fiber.await()
+     const actions = {
+-      setSidebar: vi.fn(), setDetails: vi.fn(), toggleSidebar: vi.fn(), openDetails: vi.fn(), closeDetails: vi.fn(),
++      setSidebar: vi.fn(), setDetails: vi.fn(), setSplitSession: vi.fn(), closeSplitSession: vi.fn(), toggleSidebar: vi.fn(), setNarrow: vi.fn(), openDetails: vi.fn(), closeDetails: vi.fn(),
+     }
+     const injected = (slots.entries('root')[0]!.inject as (actions: never) => object)(actions as never)
+     expect(injected).toEqual({})
+diff --git a/packages/client/ui-layout/tests/layout-store.client.spec.ts b/packages/client/ui-layout/tests/layout-store.client.spec.ts
+index c6f0069197..69a80dbe28 100644
+--- a/packages/client/ui-layout/tests/layout-store.client.spec.ts
++++ b/packages/client/ui-layout/tests/layout-store.client.spec.ts
+@@ -19,7 +19,7 @@ beforeEach(() => { localStorage.clear() })
+ describe('createLayoutStore', () => {
+   it('initializes the sidebar at its default width, details closed, wide viewport assumed', () => {
+     const { store } = createLayoutStore().create()
+-    expect(store.getSnapshot()).toEqual({ sidebar: SIDEBAR_DEFAULT, details: 0, narrow: false, narrowExpanded: false })
++    expect(store.getSnapshot()).toEqual({ sidebar: SIDEBAR_DEFAULT, details: 0, splitSessionId: undefined, narrow: false, narrowExpanded: false })
+   })
+ 
+   it('each create() is an independent instance (factory is not a singleton)', () => {
+@@ -50,12 +50,24 @@ describe('createLayoutStore', () => {
+     expect(store.getSnapshot().sidebar).toBe(SIDEBAR_DEFAULT)
+   })
+ 
++  it('opens, replaces, and closes the addressed secondary session without changing panel geometry', () => {
++    const { store, actions } = createLayoutStore().create()
++    actions.setSplitSession('s-left' as never)
++    expect(store.getSnapshot().splitSessionId).toBe('s-left')
++    actions.setSplitSession('s-right' as never)
++    expect(store.getSnapshot().splitSessionId).toBe('s-right')
++    actions.setSplitSession('s-right' as never)
++    expect(store.getSnapshot().splitSessionId).toBeUndefined()
++    actions.closeSplitSession()
++    expect(store.getSnapshot().splitSessionId).toBeUndefined()
++  })
++
+   it('narrow toggleSidebar flips only the re-expand override; the width preference survives', () => {
+     const { store, actions } = createLayoutStore().create()
+     actions.setSidebar(400)
+     actions.setNarrow(true)
+     actions.toggleSidebar()
+-    expect(store.getSnapshot()).toEqual({ sidebar: 400, details: 0, narrow: true, narrowExpanded: true })
++    expect(store.getSnapshot()).toEqual({ sidebar: 400, details: 0, splitSessionId: undefined, narrow: true, narrowExpanded: true })
+     actions.toggleSidebar()
+     expect(store.getSnapshot().narrowExpanded).toBe(false)
+     expect(store.getSnapshot().sidebar).toBe(400)
+@@ -96,6 +108,7 @@ describe('createLayoutStore', () => {
+     expect(second.store.getSnapshot()).toEqual({
+       sidebar: SIDEBAR_DEFAULT,
+       details: 0,
++      splitSessionId: undefined,
+       narrow: false,
+       narrowExpanded: false,
+     })
+diff --git a/packages/client/ui-layout/tests/service.client.spec.ts b/packages/client/ui-layout/tests/service.client.spec.ts
+index e1267b4f49..ea90a300ab 100644
+--- a/packages/client/ui-layout/tests/service.client.spec.ts
++++ b/packages/client/ui-layout/tests/service.client.spec.ts
+@@ -12,6 +12,8 @@ function fakePanels(): PanelActions {
+   return {
+     setSidebar: vi.fn(),
+     setDetails: vi.fn(),
++    setSplitSession: vi.fn(),
++    closeSplitSession: vi.fn(),
+     toggleSidebar: vi.fn(),
+     setNarrow: vi.fn(),
+     openDetails: vi.fn(),
+@@ -20,16 +22,20 @@ function fakePanels(): PanelActions {
+ }
+ 
+ describe('LayoutController', () => {
+-  it('forwards the three panel actions to the attached set', () => {
++  it('forwards the panel actions to the attached set', () => {
+     const service = new LayoutController()
+     const panels = fakePanels()
+     service.attachPanels(panels)
+ 
+     service.toggleSidebar()
++    service.splitSession('split' as never)
++    service.closeSplitSession()
+     service.openDetails()
+     service.closeDetails()
+ 
+     expect(panels.toggleSidebar).toHaveBeenCalledTimes(1)
++    expect(panels.setSplitSession).toHaveBeenCalledWith('split')
++    expect(panels.closeSplitSession).toHaveBeenCalledTimes(1)
+     expect(panels.openDetails).toHaveBeenCalledTimes(1)
+     expect(panels.closeDetails).toHaveBeenCalledTimes(1)
+     expect(panels.setSidebar).not.toHaveBeenCalled()
+@@ -39,6 +45,8 @@ describe('LayoutController', () => {
+   it('fails loud before the root entry wired its actions', () => {
+     const service = new LayoutController()
+     expect(() => { service.toggleSidebar() }).toThrow(/panel actions not wired/)
++    expect(() => { service.splitSession('split' as never) }).toThrow(/panel actions not wired/)
++    expect(() => { service.closeSplitSession() }).toThrow(/panel actions not wired/)
+     expect(() => { service.openDetails() }).toThrow(/panel actions not wired/)
+     expect(() => { service.closeDetails() }).toThrow(/panel actions not wired/)
+   })
+diff --git a/packages/client/ui-slots/README.i18n.yaml b/packages/client/ui-slots/README.i18n.yaml
+index 94f16b7b67..a9638ff96c 100644
+--- a/packages/client/ui-slots/README.i18n.yaml
++++ b/packages/client/ui-slots/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/client/ui-slots/README.md
+-README.md: 7ee2a3d22c2a41b0e5c356c52d383a047cf99029
+-README.zh.md: 0a61ec43d575429616ad5658228d1e9c93ef8462
++README.md: 55c053c4eca8f5e22ba5e399bc51f8b498b3de13
++README.zh.md: 7b6264e8619f6c25d32ef724d7ed8d5867d6bc63
+diff --git a/packages/client/ui-slots/README.md b/packages/client/ui-slots/README.md
+index 7ee2a3d22c..55c053c4ec 100644
+--- a/packages/client/ui-slots/README.md
++++ b/packages/client/ui-slots/README.md
+@@ -15,7 +15,7 @@ One `register({ name, children?, store?, inject?, ...kind }, Component)` call co
+ 
+ Chain-kind slots invert keyed routing — entries self-nominate instead of the dispatch site picking an `entryKey`: each registration carries a pure `ChainSelect` selector (plus optional ascending `priority`, ties in registration order), the first non-null return elects its entry and becomes the component's `matched` prop, and all-null falls to the owner's `renderSlotChain` fallback (`ChainRenderOpts`).
+ 
+-The standard-kit interfaces (`SessionStandardProps`, `GlobalStandardProps`) are declared empty here and merged by the runtime package (same declare-merge pattern as SlotMap keys). The renderer binds the runtime's session and workspace observable sources into selector hooks. Inject factory parameters derive from the declaration (`InjectParams`): session slots get `sessionId`, a declared store appends baked `actions`, nothing else — data access lives in the apply closure's ctx.
++The standard-kit interfaces (`SessionStandardProps`, `GlobalStandardProps`) are declared empty here and merged by the runtime package (same declare-merge pattern as SlotMap keys). The renderer binds the runtime's session and workspace observable sources into selector hooks. `RenderOpts.sessionId` addresses one nested slot tree to a resolved Session bundle without changing the global selection; its descendants inherit that bundle. Inject factory parameters derive from the declaration (`InjectParams`): session slots get `sessionId`, a declared store appends baked `actions`, nothing else — data access lives in the apply closure's ctx.
+ 
+ The store family (`defineStore` spec in / `StoreHandle<T, A>` out) types the store seat: `init` infers the state schema, `actions` is the complete draft-transform write set, `BakedActions` strips the draft parameter into the callbacks components and inject factories receive. The `defineStore` value implementation lives in the runtime package (the engine's home) and satisfies the `DefineStore` contract exported here. Engine products and the renderer host contract carry bare snapshot sources (`getSnapshot`/`subscribe`), never React hooks — hook binding belongs to the render machinery; only the props-contract hook type (`SnapshotSelectorHook`) lives here.
+ 
+diff --git a/packages/client/ui-slots/README.zh.md b/packages/client/ui-slots/README.zh.md
+index 0a61ec43d5..7b6264e861 100644
+--- a/packages/client/ui-slots/README.zh.md
++++ b/packages/client/ui-slots/README.zh.md
+@@ -15,7 +15,7 @@ Slot 注册表纯核心、slot 终端设计：SlotMap 声明合并、SlotCore 
+ 
+ chain-kind slot 会反转键控路由：条目自行提名，而不是由分发点选择 `entryKey`。每次注册都携带一个纯 `ChainSelect` selector（另有可选的升序 `priority`，相同值按注册顺序处理）；第一个非 null 返回值选中其条目，并成为组件的 `matched` prop；全部返回 null 时则使用 owner 的 `renderSlotChain` fallback（`ChainRenderOpts`）。
+ 
+-标准工具包接口（`SessionStandardProps`、`GlobalStandardProps`）在这里声明为空，由运行时包合并（与 SlotMap key 相同的 declare-merge 模式）。renderer 会把运行时会话和 Workspace observable source 绑定为 selector 钩子。Inject factory 参数从声明派生（`InjectParams`）：会话 slot 获得 `sessionId`；声明 store 时追加 baked `actions`；没有其他参数，数据访问位于 apply 闭包的 ctx 中。
++标准工具包接口（`SessionStandardProps`、`GlobalStandardProps`）在这里声明为空，由运行时包合并（与 SlotMap key 相同的 declare-merge 模式）。renderer 会把运行时会话和 Workspace observable source 绑定为 selector 钩子。`RenderOpts.sessionId` 可将一个嵌套 slot 树寻址到已解析的 Session bundle，而不改变全局选择；其后代继承该 bundle。Inject factory 参数从声明派生（`InjectParams`）：会话 slot 获得 `sessionId`；声明 store 时追加 baked `actions`；没有其他参数，数据访问位于 apply 闭包的 ctx 中。
+ 
+ store 家族（输入 `defineStore` 规范／输出 `StoreHandle<T, A>`）为 store seat 建模：`init` 推断状态 schema；`actions` 是完整的 draft-transform 写入集合；`BakedActions` 移除 draft 参数，成为组件和 inject factory 收到的回调。`defineStore` 值实现位于运行时包（引擎所属位置），并满足这里导出的 `DefineStore` 约定。引擎产物与 renderer host 约定携带裸快照 source（`getSnapshot`／`subscribe`），绝不携带 React 钩子；钩子绑定属于渲染机制，只有 props 约定钩子类型（`SnapshotSelectorHook`）位于这里。
+ 
+diff --git a/packages/client/ui-slots/src/index.ts b/packages/client/ui-slots/src/index.ts
+index 00e2eaaf7c..9341a0702b 100644
+--- a/packages/client/ui-slots/src/index.ts
++++ b/packages/client/ui-slots/src/index.ts
+@@ -225,6 +225,8 @@ export interface RenderOpts<EntryKey extends string = string> {
+   entryKey?: EntryKey
+   only?: string
+   fallback?: ReactNode
++  /** Render this outlet and every descendant session slot against one addressed session. */
++  sessionId?: SessionIdOf
+   /** Type-erased runtime seat; PropsRenderSlots narrows or removes it per slot declaration. */
+   hookContext?: unknown
+ }
+diff --git a/packages/client/ui-slots/src/renderer.ts b/packages/client/ui-slots/src/renderer.ts
+index cdad4191ea..295195f618 100644
+--- a/packages/client/ui-slots/src/renderer.ts
++++ b/packages/client/ui-slots/src/renderer.ts
+@@ -171,6 +171,8 @@ export interface SlotRendererHost {
+      * undefined while no current session resolves.
+      */
+     provideInfo: HostObservable<SessionMaybeProvideInfo>
++    /** Resolve an addressed session's standard-kit bundle for a nested split pane. */
++    resolveProvideInfo(sessionId: string): SessionMaybeProvideInfo
+   }
+   /** Workspace-side standard-kit sources. */
+   workspaces: {
+diff --git a/packages/client/ui-workspace/README.i18n.yaml b/packages/client/ui-workspace/README.i18n.yaml
+index 6d5eff023b..3182a8ce09 100644
+--- a/packages/client/ui-workspace/README.i18n.yaml
++++ b/packages/client/ui-workspace/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/client/ui-workspace/README.md
+-README.md: 8878aa49dcccd60ddcde5f0a9563bbfbd969c9c0
+-README.zh.md: c83f1c53d5471dd8d52b933163a573eb98a70c2e
++README.md: 314c32ccdcf7fdd820205c847049f381ca2bfebb
++README.zh.md: 99f2b32dc3c9e2b9a562f4e974aa8c602673812f
+diff --git a/packages/client/ui-workspace/README.md b/packages/client/ui-workspace/README.md
+index 8878aa49dc..314c32ccdc 100644
+--- a/packages/client/ui-workspace/README.md
++++ b/packages/client/ui-workspace/README.md
+@@ -12,7 +12,7 @@ The picker lists real Host Workspace entities through the global `useWorkspaces`
+ 
+ Workspace and Session hover cards copy the value their row clips: activating a Workspace card writes its full directory path, while activating a non-blank Session card writes its full display title. A provisional blank New Session card remains read-only because its localized label is a placeholder rather than session content. The card reports the dictionary-driven copied state only after the browser accepts the clipboard write.
+ 
+-The Session row's Fork action forks at the source's last completed turn, increments the inherited persisted title on the client, and then opens the child; a trailing ASCII or fullwidth parenthesized number is incremented in the same style, while an unnumbered title gets ` (1)` appended. The source and child always appear as peer rows within a workspace group, with lineage retained only as session data. A fork or rename failure leaves the current selection unchanged; after a rename failure, the created child remains in the list.
++The Session row's Fork action forks at the source's last completed turn, increments the inherited persisted title on the client, and then opens the child; a trailing ASCII or fullwidth parenthesized number is incremented in the same style, while an unnumbered title gets ` (1)` appended. The source and child always appear as peer rows within a workspace group, with lineage retained only as session data. A fork or rename failure leaves the current selection unchanged; after a rename failure, the created child remains in the list. Its **Split session** action opens the chosen Session in the secondary conversation pane without changing the primary selection; choosing the same row again closes that pane.
+ 
+ Session rows render the runtime's live `pendingInteraction` classification: approvals report **Waiting for approval**, plan reviews report **Plan awaiting review**, and ordinary questions report **Waiting for answer**. Every pending interaction uses an amber warning dot that takes precedence over the running indicator; ordinary rows repeat the localized status in their hover card, and both ordinary and search-result rows carry the same text as a visually hidden label for assistive technology. Running uses the blue indicator and its hidden label; an idle row leaves the reserved status slot empty.
+ 
+@@ -31,6 +31,6 @@ None; this package neither assembles nor sends a provider request.
+ ## Known Limitations and Deferred Work
+ 
+ - **No fuzzy content search or event deep links** — the content backend uses literal token/phrase matching, and selecting a result opens the Session rather than the matching event.
+-- **No Session deletion or unarchive control** — sessions can be archived, but archived sessions have no viewing or unarchive surface, and Workspace registration deletion does not delete Sessions.
++- **One secondary pane only** — selecting Split session replaces the prior secondary Session; comparing more than two conversations needs editor-group management.
+ - **Pending user interaction is not aggregated into collapsed groups** — a waiting row inside a collapsed group lights no group-header indicator and becomes visible only after that group is expanded.
+ - **Native folder selection depends on the local Host carrier** — under the `-native` composition, in-process or remote browser deployments cannot open a local operating-system dialog; platform failures are shown in a retryable modal. Remote-capable picking is the `-browse` composition's in-app flow.
+diff --git a/packages/client/ui-workspace/README.zh.md b/packages/client/ui-workspace/README.zh.md
+index c83f1c53d5..99f2b32dc3 100644
+--- a/packages/client/ui-workspace/README.zh.md
++++ b/packages/client/ui-workspace/README.zh.md
+@@ -12,7 +12,7 @@
+ 
+ Workspace 和 Session 悬浮卡片会复制对应行被截断的值：激活 Workspace 卡片会写入其完整目录路径，激活非空白 Session 卡片则会写入其完整显示标题。临时的空白「新会话」卡片保持只读，因为其本地化标签是占位文案，并非会话内容。只有浏览器接受剪贴板写入后，卡片才会显示由字典提供的已复制状态。
+ 
+-Session 行内的 fork 操作在源会话最后一个已完成轮次处 fork，在客户端递增继承的持久化标题后再打开子会话；尾部半角或全角括号编号会原样式递增，无编号标题追加 ` (1)`。源会话与子会话在 workspace 组内始终作为同级行展示，谱系只保留为 session 数据。Fork 或改名失败都不会改变当前选中项，改名失败时已创建的子会话仍会留在列表中。
++Session 行内的 fork 操作在源会话最后一个已完成轮次处 fork，在客户端递增继承的持久化标题后再打开子会话；尾部半角或全角括号编号会原样式递增，无编号标题追加 ` (1)`。源会话与子会话在 workspace 组内始终作为同级行展示，谱系只保留为 session 数据。Fork 或改名失败都不会改变当前选中项，改名失败时已创建的子会话仍会留在列表中。其**分屏会话**操作会在不改变主选择的情况下将所选 Session 打开到第二个对话窗格；再次选择同一行会关闭该窗格。
+ 
+ Session 行渲染运行时的实时 `pendingInteraction` 分类：审批显示**等待审批**，计划审阅显示**计划待审**，普通问题显示**等待回答**。每个待处理交互都使用一枚琥珀色警告点，优先级高于运行指示器；普通行的悬浮卡片重复显示本地化状态，普通行和搜索结果行则都以相同文本提供面向辅助技术的视觉隐藏标签。运行状态使用蓝色指示器及其隐藏标签；空闲行会保留空的状态槽位。
+ 
+@@ -31,6 +31,6 @@ Session 行渲染运行时的实时 `pendingInteraction` 分类：审批显示**
+ ## 已知限制与暂缓事项
+ 
+ - **没有模糊内容搜索或事件深链接**：内容后端采用字面 token／短语匹配，选择结果会打开 Session，而不是匹配的事件。
+-- **没有 Session 删除与取消归档控件**：会话可以归档，但已归档会话没有查看或取消归档入口；删除 Workspace 注册记录不会删除 Session。
++- **只支持一个第二窗格**：选择分屏会话会替换先前的第二 Session；比较多于两个对话需要编辑器组管理。
+ - **待处理的用户交互不会聚合到折叠的分组上**：折叠分组内正在等待的行不会点亮分组头指示，只有展开该分组后才可见。
+ - **原生文件夹选择依赖本地 Host 载体**：在 `-native` 组合下，进程内部署或远程浏览器部署无法打开本地操作系统对话框；模态框会显示平台故障，并允许重试。可远程的选取是 `-browse` 组合的应用内流程。
+diff --git a/packages/client/ui-workspace/package.json b/packages/client/ui-workspace/package.json
+index e76b9e138c..b8d1876b25 100644
+--- a/packages/client/ui-workspace/package.json
++++ b/packages/client/ui-workspace/package.json
+@@ -35,6 +35,7 @@
+         "@deepseek-ai/dsh-client-locale",
+         "@deepseek-ai/dsh-client-runtime",
+         "@deepseek-ai/dsh-client-ui-conversation",
++        "@deepseek-ai/dsh-client-ui-layout",
+         "@deepseek-ai/dsh-client-ui-sidebar"
+       ],
+       "platform": "web"
+@@ -53,6 +54,7 @@
+     "@deepseek-ai/dsh-client-runtime": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-primitives": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-slots": "workspace:^",
++    "@deepseek-ai/dsh-client-ui-layout": "workspace:^",
+     "@deepseek-ai/dsh-invariants": "workspace:^",
+     "@deepseek-ai/cordis": "workspace:^",
+     "react": "^18.2.0"
+@@ -65,6 +67,7 @@
+     "@deepseek-ai/dsh-client-ui-primitives": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-sidebar": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-slots": "workspace:^",
++    "@deepseek-ai/dsh-client-ui-layout": "workspace:^",
+     "@deepseek-ai/dsh-invariants": "workspace:^",
+     "@types/react": "~18.3.1",
+     "@deepseek-ai/cordis": "workspace:^",
+diff --git a/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx b/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx
+index d0f6835472..c269c7efa2 100644
+--- a/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx
++++ b/packages/client/ui-workspace/src/client/WorkspaceBrowser.tsx
+@@ -215,7 +215,7 @@ function workspaceGroupHalf(e: { clientY: number; currentTarget: HTMLElement }):
+ 
+ type SessionTreeProps = Pick<
+   WorkspaceBrowserProps,
+-  'useSessions' | 'startSession' | 'open' | 'forkSession'
++  'useSessions' | 'startSession' | 'open' | 'forkSession' | 'splitSession'
+   | 'insertWorkspaceBefore' | 'insertSessionBefore' | 't'
+ > & {
+   workspaces: readonly WorkspaceView[]
+@@ -247,7 +247,7 @@ type SessionTreeProps = Pick<
+ 
+ /** The scrolling session tree; unmounting drops the sessions subscription and expand-all state. */
+ function SessionTree({
+-  useSessions, startSession, open, forkSession, workspaces, archivedSessionIds,
++  useSessions, startSession, open, forkSession, splitSession, workspaces, archivedSessionIds,
+   onRenameRequest, onDeleteRequest, onSessionRename, onSessionArchive,
+   insertWorkspaceBefore, insertSessionBefore, orderBy,
+   groupExpansion, setGroupExpanded,
+@@ -515,6 +515,7 @@ function SessionTree({
+                     onOpen={open}
+                     onRename={onSessionRename}
+                     onFork={forkSession}
++                    onSplit={splitSession}
+                     onArchive={onSessionArchive}
+                     drag={dragProps}
+                     t={t}
+@@ -544,13 +545,14 @@ function SessionTree({
+ 
+ /** The flat "In one list" body: every session is one draggable top-level row. */
+ function FlatList({
+-  useSessions, open, forkSession, onSessionRename, onSessionArchive, archivedSessionIds,
++  useSessions, open, forkSession, splitSession, onSessionRename, onSessionArchive, archivedSessionIds,
+   orderBy, sessionOrderByAccount, sessionUpdatedAtByAccount, syncSessionOrderAccount, setSessionOrder, t,
+ }: Pick<
+   SessionTreeProps,
+   | 'useSessions'
+   | 'open'
+   | 'forkSession'
++  | 'splitSession'
+   | 'onSessionRename'
+   | 'onSessionArchive'
+   | 'archivedSessionIds'
+@@ -631,6 +633,7 @@ function FlatList({
+               onOpen={open}
+               onRename={onSessionRename}
+               onFork={forkSession}
++              onSplit={splitSession}
+               onArchive={onSessionArchive}
+               flat
+               drag={{
+@@ -749,6 +752,7 @@ export function WorkspaceBrowser({
+   open,
+   renameSession,
+   forkSession,
++  splitSession,
+   renameWorkspace,
+   deleteWorkspace,
+   insertWorkspaceBefore,
+@@ -1122,7 +1126,7 @@ export function WorkspaceBrowser({
+           : groupBy === 'flat'
+             ? (
+               <FlatList
+-                useSessions={useSessions} open={open} forkSession={forkSession}
++                useSessions={useSessions} open={open} forkSession={forkSession} splitSession={splitSession}
+                 onSessionRename={onSessionRename} onSessionArchive={onSessionArchive}
+                 archivedSessionIds={archivedSessionIds}
+                 orderBy={orderBy}
+@@ -1139,6 +1143,7 @@ export function WorkspaceBrowser({
+                 onSessionRename={onSessionRename}
+                 onSessionArchive={onSessionArchive}
+                 forkSession={forkSession}
++                splitSession={splitSession}
+                 workspaces={workspaces}
+                 groupExpansion={groupExpansion}
+                 setGroupExpanded={actions.setGroupExpanded}
+diff --git a/packages/client/ui-workspace/src/client/contract/slots.ts b/packages/client/ui-workspace/src/client/contract/slots.ts
+index 8027a3623a..5d0c31dd93 100644
+--- a/packages/client/ui-workspace/src/client/contract/slots.ts
++++ b/packages/client/ui-workspace/src/client/contract/slots.ts
+@@ -112,6 +112,8 @@ export type WorkspaceBrowserInjected = DirectoryPickingInjected & {
+   renameSession: (sessionId: SessionId, title: string) => Promise<void>
+   /** Fork a Session at its last completed turn and open the child. */
+   forkSession: (sessionId: SessionId) => void
++  /** Render a Session in the fixed secondary conversation pane. */
++  splitSession: (sessionId: SessionId) => void
+   /** Rename a Host Workspace (rejects on name conflict; resolves on durability). */
+   renameWorkspace: (workspaceId: WorkspaceId, title: string) => Promise<void>
+   /** Delete only a Host Workspace registration; directory and Session logs remain. */
+diff --git a/packages/client/ui-workspace/src/client/index.ts b/packages/client/ui-workspace/src/client/index.ts
+index 6b14243ecf..2b07aa7046 100644
+--- a/packages/client/ui-workspace/src/client/index.ts
++++ b/packages/client/ui-workspace/src/client/index.ts
+@@ -12,6 +12,7 @@ import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
+ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+ // Type-only: pulls the locale plugin's Context merge (ctx.locale).
+ import type {} from '@deepseek-ai/dsh-client-locale/client'
++import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
+ import type { WorkspaceBrowserInjected, WorkspacePickerInjected } from './contract/slots.ts'
+ import { createWorkspaceViewStore } from './stores.ts'
+ import { WorkspaceBrowser } from './WorkspaceBrowser.tsx'
+@@ -42,7 +43,7 @@ const NS = 'workspace'
+  * provides a waitable service. apply therefore depends on each slot
+  * declaration through `slots.inject()` instead of assuming order.
+  */
+-export const inject = ['slots', 'sessions', 'workspaces', 'locale']
++export const inject = ['slots', 'sessions', 'workspaces', 'locale', 'layout']
+ 
+ /**
+  * Register the browser and picker once their slot declarations are on the
+@@ -89,6 +90,10 @@ export function apply(ctx: ClientContext): void {
+           // Fork or child-rename failure keeps the current selection.
+         })
+     },
++    splitSession: (sessionId) => {
++      ctx.sessions.openInPane(sessionId)
++      ctx.layout.splitSession(sessionId)
++    },
+     renameWorkspace: async (workspaceId, title) => { await ctx.workspaces.rename(workspaceId, title) },
+     deleteWorkspace: async (workspaceId) => { await ctx.workspaces.delete(workspaceId) },
+     insertWorkspaceBefore: async (workspaceId, beforeWorkspaceId) => {
+diff --git a/packages/client/ui-workspace/src/client/locales.ts b/packages/client/ui-workspace/src/client/locales.ts
+index c08fd931de..3e32cd12fe 100644
+--- a/packages/client/ui-workspace/src/client/locales.ts
++++ b/packages/client/ui-workspace/src/client/locales.ts
+@@ -44,6 +44,7 @@ export const zh = {
+   'delete.desc': '将把“{name}”从工作区列表中移除。文件夹与会话记录会保留，其会话将显示在“未分组”下。',
+   'delete.pending': '正在删除工作区…',
+   'menu.fork': '分叉会话',
++  'menu.splitSession': '分屏会话',
+   'menu.archiveSession': '归档会话',
+   'sessions.count.one': '{n} 个会话',
+   'sessions.count.other': '{n} 个会话',
+@@ -113,6 +114,7 @@ export const en = {
+   'delete.desc': 'This removes “{name}” from the workspace list. The folder and session logs will be kept. Its sessions will appear under Ungrouped.',
+   'delete.pending': 'Deleting workspace…',
+   'menu.fork': 'Fork session',
++  'menu.splitSession': 'Split session',
+   'menu.archiveSession': 'Archive session',
+   'sessions.count.one': '{n} session',
+   'sessions.count.other': '{n} sessions',
+diff --git a/packages/client/ui-workspace/src/client/rows/Rows.tsx b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+index 481e0f0e47..86879e5f36 100644
+--- a/packages/client/ui-workspace/src/client/rows/Rows.tsx
++++ b/packages/client/ui-workspace/src/client/rows/Rows.tsx
+@@ -2,14 +2,14 @@
+  * Workspace browser tree row components (figma Cell set 14:3080): pure presentational —
+  * all data and callbacks arrive via props. Hover swaps (folder->chevron,
+  * time->ellipsis, action buttons) are CSS-only. Row ... menus are visual-only
+- * except workspace Rename/Delete and session Rename/Fork/Archive; the session
+- * and workspace hover cards are suppressed while a menu is open.
++ * except workspace Rename/Delete and session Rename/Fork/Split/Archive; the
++ * session and workspace hover cards are suppressed while a menu is open.
+  */
+ import { useState } from 'react'
+ import clsx from 'clsx'
+ import {
+   HoverCard, IconArchiveOutline20, IconBranchOutline16, IconEditOutline16,
+-  IconEllipsisOutline16, IconFolderClose16, IconFolderOpen16, IconPlusOutline16,
++  IconEllipsisOutline16, IconFolderClose16, IconFolderOpen16, IconPanelLeftOutline16, IconPlusOutline16,
+   IconTrashOutline16, IconTriangleRightFill14, Menu, StateDot,
+ } from '@deepseek-ai/dsh-client-ui-primitives'
+ import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
+@@ -344,13 +344,14 @@ export function SearchResultItem({ result, currentId, onOpen, t }: {
+  * @param props.onOpen - open a session by id.
+  * @param props.onRename - open the session rename dialog (id + current title).
+  * @param props.onFork - fork a session at its last completed turn.
++ * @param props.onSplit - render a session in the fixed secondary pane.
+  * @param props.onArchive - archive a session by id.
+  * @param props.drag - optional draggable-row wiring.
+  * @param props.flat - omit the empty status slot in the hierarchy-free flat list.
+  * @param props.t - the browser root's locale seat.
+  * @returns the session row.
+  */
+-export function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork, onArchive, drag, flat = false, t }: {
++export function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork, onSplit, onArchive, drag, flat = false, t }: {
+   node: SessionNode
+   currentId: string | undefined
+   now: number
+@@ -359,6 +360,8 @@ export function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork
+   onRename: (id: SessionNode['id'], currentTitle: string) => void
+   /** Fork a session at its last completed turn (row menu action). */
+   onFork: (id: SessionNode['id']) => void
++  /** Render this session in the fixed secondary pane when split layout is available. */
++  onSplit?: ((id: SessionNode['id']) => void) | undefined
+   /** Archive this session (row menu action; commits without a dialog). */
+   onArchive: (id: SessionNode['id']) => void
+   /** Present only on draggable rows (workspace-group sessions outside search). */
+@@ -380,6 +383,7 @@ export function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork
+   const sessionMenuItems = [
+     { id: 'rename', label: t('rename'), icon: <IconEditOutline16 /> },
+     { id: 'fork', label: t('menu.fork'), icon: <IconBranchOutline16 /> },
++    ...(onSplit === undefined ? [] : [{ id: 'split', label: t('menu.splitSession'), icon: <IconPanelLeftOutline16 /> }]),
+     // 20-native glyph in the menu's 16px icon slot (Menu.module.css .itemIcon).
+     { id: 'archive', label: t('menu.archiveSession'), icon: <IconArchiveOutline20 size={16} /> },
+   ]
+@@ -443,6 +447,7 @@ export function SessionNodeItem({ node, currentId, now, onOpen, onRename, onFork
+               setMenuOpen(false)
+               if (id === 'rename') onRename(node.id, row.title)
+               if (id === 'fork') onFork(node.id)
++              if (id === 'split') onSplit?.(node.id)
+               if (id === 'archive') onArchive(node.id)
+             }}
+             portal
+diff --git a/packages/client/ui-workspace/tests/apply.client.spec.ts b/packages/client/ui-workspace/tests/apply.client.spec.ts
+index 016af313f8..58840b3006 100644
+--- a/packages/client/ui-workspace/tests/apply.client.spec.ts
++++ b/packages/client/ui-workspace/tests/apply.client.spec.ts
+@@ -32,15 +32,18 @@ async function bench() {
+   const renameSession = vi.fn(async (title: string) => ({ ok: true, value: { title, seq: 1 } }))
+   const binding = vi.fn(() => ({ session: { rename: renameSession } }))
+   const fork = vi.fn(async () => 'forked' as never)
++  const openInPane = vi.fn()
++  const splitSession = vi.fn()
+   ctx.provide('workspaces', {
+     create, startSession, rename, insertSessionBefore,
+   } as never)
+-  ctx.provide('sessions', { open, clear, search, searchResultLimit: 20, binding, fork } as never)
++  ctx.provide('sessions', { open, openInPane, clear, search, searchResultLimit: 20, binding, fork } as never)
++  ctx.provide('layout', { splitSession } as never)
+   const locale = new LocaleRuntime(ctx)
+   ctx.provide('locale', locale)
+   return {
+     ctx, slots: ctx.get('slots') as SlotRegistry, locale, create, startSession, rename,
+-    insertSessionBefore, open, clear, search, renameSession, binding, fork,
++    insertSessionBefore, open, openInPane, clear, search, renameSession, binding, fork, splitSession,
+   }
+ }
+ 
+@@ -54,7 +57,7 @@ function declare(slots: SlotRegistry, ...names: HoleName[]): () => void {
+ 
+ describe('ui-workspace apply', () => {
+   it('declares the services it drives', () => {
+-    expect(inject).toEqual(['slots', 'sessions', 'workspaces', 'locale'])
++    expect(inject).toEqual(['slots', 'sessions', 'workspaces', 'locale', 'layout'])
+   })
+ 
+   it('registers browser and pickers for declarations arriving before or after apply', async () => {
+@@ -103,6 +106,9 @@ describe('ui-workspace apply', () => {
+       expect(b.open).toHaveBeenCalledWith('forked')
+     })
+     expect(b.fork).toHaveBeenCalledWith({ sessionId: 'session', increaseTitle: true })
++    browser.splitSession('session' as never)
++    expect(b.openInPane).toHaveBeenCalledWith('session')
++    expect(b.splitSession).toHaveBeenCalledWith('session')
+     await browser.renameWorkspace('ws' as never, 'renamed')
+     expect(b.rename).toHaveBeenCalledWith('ws', 'renamed')
+     await browser.insertSessionBefore('ws' as never, 's1' as never, 's2' as never)
+diff --git a/packages/client/ui-workspace/tests/rows.client.spec.tsx b/packages/client/ui-workspace/tests/rows.client.spec.tsx
+index c7a153ff5f..1b922422e5 100644
+--- a/packages/client/ui-workspace/tests/rows.client.spec.tsx
++++ b/packages/client/ui-workspace/tests/rows.client.spec.tsx
+@@ -338,17 +338,18 @@ describe('workspace browser rows', () => {
+     }
+   })
+ 
+-  it('session row menu opens without opening the session and dispatches rename, fork, and archive', () => {
++  it('session row menu opens without opening the session and dispatches rename, fork, split, and archive', () => {
+     const onOpen = vi.fn()
+     const onRename = vi.fn()
+     const onFork = vi.fn()
++    const onSplit = vi.fn()
+     const onArchive = vi.fn()
+     const node: SessionNode = {
+       id: sid('s1'), title: 'One', blank: false, running: false,
+       runningSubagentCount: 0, completed: false, updatedAt: 0,
+     }
+     render(<SessionNodeItem node={node} currentId={undefined} now={0} onOpen={onOpen}
+-      onRename={onRename} onFork={onFork} onArchive={onArchive} t={t} />)
++      onRename={onRename} onFork={onFork} onSplit={onSplit} onArchive={onArchive} t={t} />)
+     fireEvent.click(screen.getByRole('button', { name: '会话“One”的操作' }))
+     expect(onOpen).not.toHaveBeenCalled()
+     // Archive is not destructive (log and accounting slot remain): no danger styling.
+@@ -361,6 +362,10 @@ describe('workspace browser rows', () => {
+     fireEvent.click(screen.getByRole('button', { name: '会话“One”的操作' }))
+     fireEvent.click(screen.getByRole('menuitem', { name: '分叉会话' }))
+     expect(onFork).toHaveBeenCalledWith(node.id)
++    fireEvent.click(screen.getByRole('button', { name: '会话“One”的操作' }))
++    fireEvent.click(screen.getByRole('menuitem', { name: '分屏会话' }))
++    expect(onSplit).toHaveBeenCalledWith(node.id)
++    expect(onOpen).not.toHaveBeenCalled()
+     // Archive dispatches without opening the session.
+     fireEvent.click(screen.getByRole('button', { name: '会话“One”的操作' }))
+     fireEvent.click(screen.getByRole('menuitem', { name: '归档会话' }))
+diff --git a/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx b/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
+index fbe42fc279..4235966ded 100644
+--- a/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
++++ b/packages/client/ui-workspace/tests/workspace-browser.client.spec.tsx
+@@ -73,6 +73,7 @@ function mount(overrides: Partial<WorkspaceBrowserProps> = {}) {
+     searchResultLimit: 20,
+     renameSession: vi.fn(async () => {}),
+     forkSession: vi.fn(),
++    splitSession: vi.fn(),
+     renameWorkspace: vi.fn(async () => {}),
+     deleteWorkspace: vi.fn(async () => {}),
+     archiveSession: vi.fn(async () => {}),
+diff --git a/packages/client/web-react/README.i18n.yaml b/packages/client/web-react/README.i18n.yaml
+index 95ac9eba5b..61488849c6 100644
+--- a/packages/client/web-react/README.i18n.yaml
++++ b/packages/client/web-react/README.i18n.yaml
+@@ -2,5 +2,5 @@
+ # side as of the last confirmed-consistent state. Both languages carry equal authority;
+ # after editing either side, bring the other along and re-record with:
+ #   pnpm run verify-translation-pairing --write packages/client/web-react/README.md
+-README.md: 4f52e08ba53b51ce2c095f3fefd86a0dae3dfa9c
+-README.zh.md: dff1fbe09e80fa2fcc058d1d8cf54de8c8db231f
++README.md: 2f0bde6aaaebc086c247fbf8dfb11dddffbbbe56
++README.zh.md: 47083e934f8e459c453578bfe9bd77a85e47d056
+diff --git a/packages/client/web-react/README.md b/packages/client/web-react/README.md
+index 4f52e08ba5..2f0bde6aaa 100644
+--- a/packages/client/web-react/README.md
++++ b/packages/client/web-react/README.md
+@@ -2,7 +2,7 @@
+ 
+ English | [中文](README.zh.md)
+ 
+-Shell-side React glue for the slot terminal design: createSlotRenderer (the SlotRenderer implementation the shell installs into the runtime SlotRegistry), SessionProvider (framework-wired render prop, also injected as a standard seat to entries declaring session-scope children), bindSnapshotSelector (the one hook constructor — hosts and engines traffic in bare observable sources; every hook binds here, cached per source), useInvoke. Chain-slot outlets run the registered selectors in chain order at render time and mount only the elected entry, its select return joining the props as `matched`; the `renderSlotChain` binding is per-entry cached like `renderSlot`. The snapshot-store engine and defineStore live in runtime; business plugins depend on ui-slots types only, never on this package.
++Shell-side React glue for the slot terminal design: createSlotRenderer (the SlotRenderer implementation the shell installs into the runtime SlotRegistry), SessionProvider (framework-wired render prop, also injected as a standard seat to entries declaring session-scope children), SessionBindingProvider (an addressed nested slot tree's resolved session bundle), bindSnapshotSelector (the one hook constructor — hosts and engines traffic in bare observable sources; every hook binds here, cached per source), useInvoke. A `renderSlot` occurrence carrying `RenderOpts.sessionId` resolves that bundle once and supplies it to every descendant session slot without changing the global selection. Chain-slot outlets run the registered selectors in chain order at render time and mount only the elected entry, its select return joining the props as `matched`; the `renderSlotChain` binding is per-entry cached like `renderSlot`. The snapshot-store engine and defineStore live in runtime; business plugins depend on ui-slots types only, never on this package.
+ 
+ ## Model Experience
+ 
+diff --git a/packages/client/web-react/README.zh.md b/packages/client/web-react/README.zh.md
+index dff1fbe09e..47083e934f 100644
+--- a/packages/client/web-react/README.zh.md
++++ b/packages/client/web-react/README.zh.md
+@@ -2,7 +2,7 @@
+ 
+ [English](README.md) | 中文
+ 
+-slot 终端设计的外壳侧 React 胶水：createSlotRenderer（外壳安装到运行时 SlotRegistry 的 SlotRenderer 实现）、SessionProvider（由框架接入的 render prop，也作为标准 seat 注入到声明会话 scope 子 slot 的配置项）、bindSnapshotSelector（唯一的钩子构造器：主机与引擎只传递裸 observable source；每个钩子在此绑定，并按 source 缓存）、useInvoke。链式 slot outlet 在渲染时按链顺序运行已注册 selector，只挂载被选中的配置项，其 select 返回值以 `matched` 加入 props；`renderSlotChain` 绑定与 `renderSlot` 一样按配置项缓存。快照 store 引擎与 defineStore 位于运行时；业务插件只依赖 ui-slots 类型，绝不依赖该包。
++slot 终端设计的外壳侧 React 胶水：createSlotRenderer（外壳安装到运行时 SlotRegistry 的 SlotRenderer 实现）、SessionProvider（由框架接入的 render prop，也作为标准 seat 注入到声明会话 scope 子 slot 的配置项）、SessionBindingProvider（供已寻址嵌套 slot 树使用的已解析 Session bundle）、bindSnapshotSelector（唯一的钩子构造器：主机与引擎只传递裸 observable source；每个钩子在此绑定，并按 source 缓存）、useInvoke。携带 `RenderOpts.sessionId` 的 `renderSlot` 调用会解析该 bundle 一次，并将其提供给每个后代 session slot，而不改变全局选择。链式 slot outlet 在渲染时按链顺序运行已注册 selector，只挂载被选中的配置项，其 select 返回值以 `matched` 加入 props；`renderSlotChain` 绑定与 `renderSlot` 一样按配置项缓存。快照 store 引擎与 defineStore 位于运行时；业务插件只依赖 ui-slots 类型，绝不依赖该包。
+ 
+ ## 模型体验
+ 
+diff --git a/packages/client/web-react/src/scoped-slots.tsx b/packages/client/web-react/src/scoped-slots.tsx
+index dea0511319..af4a8c599a 100644
+--- a/packages/client/web-react/src/scoped-slots.tsx
++++ b/packages/client/web-react/src/scoped-slots.tsx
+@@ -10,8 +10,8 @@ import {
+   type SlotScope, type StoredEntry, type Translate,
+ } from '@deepseek-ai/dsh-client-ui-slots'
+ import {
+-  HostContext, SessionMaybeProvider, SessionProvider, SlotAssemblyError, maybeObservableHook,
+-  observableHook, projectionHook, useHost, useSessionMaybeProvideInfo,
++  HostContext, SessionBindingProvider, SessionMaybeProvider, SessionProvider, SlotAssemblyError,
++  maybeObservableHook, observableHook, projectionHook, useHost, useSessionMaybeProvideInfo,
+ } from './session-provider.tsx'
+ 
+ type InjectedProps = Record<string, unknown>
+@@ -665,7 +665,11 @@ function SlotOutlet({ slotKey, ownerProps, opts }: {
+   // Locale revision tick: a locale switch re-renders every outlet, and entry
+   // bodies re-derive their `t` seat at the new revision (fresh identity).
+   useLocaleRevision(host.locale)
+-  const sessionInfo = useSessionMaybeProvideInfo()
++  const currentInfo = useSessionMaybeProvideInfo()
++  const targetInfo = opts?.sessionId === undefined
++    ? currentInfo
++    : host.sessions.resolveProvideInfo(opts.sessionId)
++  const content = renderOutletContent(host, slotKey, ownerProps, opts, targetInfo)
+   // Anchor contract: every slot render site exposes a stable
+   // `[data-slot="<key>"]` wrapper — the addressable seam dynamic styles
+   // target — and `display:contents` keeps it layout-neutral. The wrapper
+@@ -674,7 +678,9 @@ function SlotOutlet({ slotKey, ownerProps, opts }: {
+   // never flickers with registration churn.
+   return (
+     <div data-slot={slotKey} style={ANCHOR_STYLE}>
+-      {renderOutletContent(host, slotKey, ownerProps, opts, sessionInfo)}
++      {opts?.sessionId === undefined ? content : (
++        <SessionBindingProvider info={targetInfo}>{content}</SessionBindingProvider>
++      )}
+     </div>
+   )
+ }
+diff --git a/packages/client/web-react/src/session-provider.tsx b/packages/client/web-react/src/session-provider.tsx
+index 196a4d9fd9..ef267b51f8 100644
+--- a/packages/client/web-react/src/session-provider.tsx
++++ b/packages/client/web-react/src/session-provider.tsx
+@@ -30,6 +30,14 @@ export function useHost(): SlotRendererHost {
+ 
+ const BindingContext = createContext<SessionMaybeProvideInfo | null>(null)
+ 
++/** Supply one already-materialized session bundle to a nested slot subtree. */
++export function SessionBindingProvider({ info, children }: {
++  info: SessionMaybeProvideInfo
++  children: ReactNode
++}) {
++  return <BindingContext.Provider value={info}>{children}</BindingContext.Provider>
++}
++
+ /** Read the current-session-optional bundle supplied at the root. */
+ export function useSessionMaybeProvideInfo(): SessionMaybeProvideInfo {
+   const info = useContext(BindingContext)
+diff --git a/packages/client/web-react/tests/scoped-slots-real-core.client.spec.tsx b/packages/client/web-react/tests/scoped-slots-real-core.client.spec.tsx
+index 0e94030729..e2da95167a 100644
+--- a/packages/client/web-react/tests/scoped-slots-real-core.client.spec.tsx
++++ b/packages/client/web-react/tests/scoped-slots-real-core.client.spec.tsx
+@@ -39,6 +39,7 @@ function hostOver(core: SlotCore): SlotRendererHost {
+     sessions: {
+       list: { getSnapshot: () => ({}), subscribe: () => () => {} },
+       provideInfo: { getSnapshot: () => absentInfo, subscribe: () => () => {} },
++      resolveProvideInfo: () => absentInfo,
+     },
+     workspaces: {
+       list: { getSnapshot: () => ({}), subscribe: () => () => {} },
+diff --git a/packages/client/web-react/tests/scoped-slots.client.spec.tsx b/packages/client/web-react/tests/scoped-slots.client.spec.tsx
+index b5d7e2d3b1..e7d4a00699 100644
+--- a/packages/client/web-react/tests/scoped-slots.client.spec.tsx
++++ b/packages/client/web-react/tests/scoped-slots.client.spec.tsx
+@@ -151,6 +151,7 @@ function makeHost() {
+     sessions: {
+       list,
+       provideInfo: provide,
++      resolveProvideInfo: id => infos.get(id) ?? absentInfo,
+     },
+     workspaces: { list: workspaces },
+   }
+@@ -667,6 +668,29 @@ describe('standard-kit synthesis', () => {
+     expect(props['sessionId']).toBe('s1')
+   })
+ 
++  it('binds a nested outlet to its addressed session without moving the primary selection', () => {
++    const h = makeHost()
++    h.declare('k.session', SINGLE_SESSION)
++    h.addSession('s1')
++    h.addSession('s2')
++    const seen: string[] = []
++    h.add('k.session', {
++      component: ({ sessionId }: { sessionId?: string }) => {
++        seen.push(sessionId ?? 'absent')
++        return <b>{sessionId}</b>
++      },
++    })
++    mountRoot(h, { 'k.session': SINGLE_SESSION }, renderSlot => (
++      <>
++        <SessionProvider>{() => renderSlot('k.session', {})}</SessionProvider>
++        {renderSlot('k.session', {}, { sessionId: 's2' as never })}
++      </>
++    ))
++    act(() => { h.current.set('s1') })
++    expect(seen).toContain('s1')
++    expect(seen).toContain('s2')
++  })
++
+   it('binds only function-valued inject hooks to the standard kit and render occurrence context', () => {
+     const h = makeHost()
+     const turnDataFactory = vi.fn((standard: AnyProps, turn: unknown) => (key: string) => {
+diff --git a/packages/client/web-react/tests/session-provider.client.spec.tsx b/packages/client/web-react/tests/session-provider.client.spec.tsx
+index af46f4138b..752131a5e0 100644
+--- a/packages/client/web-react/tests/session-provider.client.spec.tsx
++++ b/packages/client/web-react/tests/session-provider.client.spec.tsx
+@@ -56,6 +56,7 @@ function makeHost(bodies: { root: (rp: (key: string, owner: object) => React.Rea
+     sessions: {
+       list: observable<unknown>({ ids: [] }),
+       provideInfo: provide,
++      resolveProvideInfo: () => absentInfo,
+     },
+     workspaces: { list: observable<unknown>({ items: [] }) },
+   }
+diff --git a/packages/client/web-react/tests/stale-authorization.client.spec.tsx b/packages/client/web-react/tests/stale-authorization.client.spec.tsx
+index e617ddecdd..f594677c4c 100644
+--- a/packages/client/web-react/tests/stale-authorization.client.spec.tsx
++++ b/packages/client/web-react/tests/stale-authorization.client.spec.tsx
+@@ -45,6 +45,7 @@ function makeHost() {
+     sessions: {
+       list: { getSnapshot: () => ({}), subscribe: () => () => {} },
+       provideInfo: { getSnapshot: () => absentInfo, subscribe: () => () => {} },
++      resolveProvideInfo: () => absentInfo,
+     },
+     workspaces: {
+       list: { getSnapshot: () => ({}), subscribe: () => () => {} },
+diff --git a/packages/client/web-react/tests/use-projection.client.spec.tsx b/packages/client/web-react/tests/use-projection.client.spec.tsx
+index 1af4f1abb1..100edaa25d 100644
+--- a/packages/client/web-react/tests/use-projection.client.spec.tsx
++++ b/packages/client/web-react/tests/use-projection.client.spec.tsx
+@@ -59,6 +59,7 @@ function makeHost() {
+     sessions: {
+       list: observable<unknown>({ ids: [] }),
+       provideInfo: provide,
++      resolveProvideInfo: id => info(id),
+     },
+     workspaces: { list: observable<unknown>({ items: [] }) },
+   }
+diff --git a/packages/extensions/cordis-client-runner/src/client/slot-catalog.ts b/packages/extensions/cordis-client-runner/src/client/slot-catalog.ts
+index dbd3731614..1a4db93364 100644
+--- a/packages/extensions/cordis-client-runner/src/client/slot-catalog.ts
++++ b/packages/extensions/cordis-client-runner/src/client/slot-catalog.ts
+@@ -108,7 +108,7 @@ export const CLIENT_SLOT_API: readonly ClientSlotEntry[] = [
+     ],
+     replaceRisk: 'shadows-shipped-ui',
+     example: 'return {\n  inject: [\'slots\'],\n  apply(ctx) {\n    ctx.slots.inject(\'conversation\', () => ctx.slots.register(\n      { name: \'conversation\' },\n      () => React.createElement(\'div\', null, \'hello\'),\n    ))\n  },\n}',
+-    source: 'packages/client/ui-layout/src/client/index.ts:62',
++    source: 'packages/client/ui-layout/src/client/index.ts:69',
+   },
+   {
+     key: 'conversation.chat.assistant-actions',
+@@ -1046,7 +1046,7 @@ export const CLIENT_SLOT_API: readonly ClientSlotEntry[] = [
+     ],
+     replaceRisk: 'shadows-shipped-ui',
+     example: 'return {\n  inject: [\'slots\'],\n  apply(ctx) {\n    ctx.slots.inject(\'details\', () => ctx.slots.register(\n      { name: \'details\' },\n      () => React.createElement(\'div\', null, \'hello\'),\n    ))\n  },\n}',
+-    source: 'packages/client/ui-layout/src/client/index.ts:72',
++    source: 'packages/client/ui-layout/src/client/index.ts:79',
+   },
+   {
+     key: 'root',
+@@ -1460,7 +1460,7 @@ export const CLIENT_SLOT_API: readonly ClientSlotEntry[] = [
+     occupants: [],
+     replaceRisk: 'none',
+     example: 'return {\n  inject: [\'slots\'],\n  apply(ctx) {\n    ctx.slots.inject(\'shell.overlay\', () => ctx.slots.register(\n      { name: \'shell.overlay\', id: \'my-entry\', order: 100, label: \'My entry\' },\n      () => React.createElement(\'div\', null, \'hello\'),\n    ))\n  },\n}',
+-    source: 'packages/client/ui-layout/src/client/index.ts:83',
++    source: 'packages/client/ui-layout/src/client/index.ts:90',
+   },
+   {
+     key: 'sidebar',
+@@ -1486,7 +1486,7 @@ export const CLIENT_SLOT_API: readonly ClientSlotEntry[] = [
+     ],
+     replaceRisk: 'shadows-shipped-ui',
+     example: 'return {\n  inject: [\'slots\'],\n  apply(ctx) {\n    ctx.slots.inject(\'sidebar\', () => ctx.slots.register(\n      { name: \'sidebar\' },\n      () => React.createElement(\'div\', null, \'hello\'),\n    ))\n  },\n}',
+-    source: 'packages/client/ui-layout/src/client/index.ts:49',
++    source: 'packages/client/ui-layout/src/client/index.ts:56',
+   },
+   {
+     key: 'sidebar.footer.action',
+diff --git a/packages/test-support/client-runtime/src/sessions.ts b/packages/test-support/client-runtime/src/sessions.ts
+index c014d6f002..b5832d5676 100644
+--- a/packages/test-support/client-runtime/src/sessions.ts
++++ b/packages/test-support/client-runtime/src/sessions.ts
+@@ -184,7 +184,7 @@ export class TestSessions implements ISessions {
+ 
+   /** Calls observed on the service-level face, newest last. */
+   readonly calls: {
+-    method: 'open' | 'openSubagent' | 'setSubagentCatalogOpen' | 'refreshSubagents'
++    method: 'open' | 'openInPane' | 'openSubagent' | 'setSubagentCatalogOpen' | 'refreshSubagents'
+       | 'clear' | 'search' | 'fork'
+     args: unknown[]
+   }[] = []
+@@ -348,6 +348,11 @@ export class TestSessions implements ISessions {
+     return (id === undefined ? undefined : this.provideInfo(id)) ?? this.channel.maybeInfo
+   }
+ 
++  /** Resolve an existing addressed session bundle without changing selection. */
++  paneProvideInfo(id: SessionId): SessionMaybeProvideInfo {
++    return this.provideInfo(id) ?? this.channel.maybeInfo
++  }
++
+   /**
+    * Resolve (mint on first touch) the session-scoped Cordis context through
+    * the production `createScope`, so real `scopeOf`/scope-addressed services
+@@ -413,6 +418,12 @@ export class TestSessions implements ISessions {
+     })
+   }
+ 
++  /** Open an existing fixture's history window without changing selection. */
++  openInPane(id: SessionId): void {
++    this.calls.push({ method: 'openInPane', args: [id] })
++    this.require(id)
++  }
++
+   /** Open an existing fixture through its catalog address. */
+   openSubagent(address: SubagentAddress): void {
+     this.calls.push({ method: 'openSubagent', args: [address] })
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index bcc517d651..11e54d9924 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -3044,6 +3044,9 @@ importers:
+       '@deepseek-ai/dsh-client-ui-conversation':
+         specifier: workspace:^
+         version: link:../ui-conversation
++      '@deepseek-ai/dsh-client-ui-layout':
++        specifier: workspace:^
++        version: link:../ui-layout
+       '@deepseek-ai/dsh-client-ui-primitives':
+         specifier: workspace:^
+         version: link:../ui-primitives
+@@ -12962,8 +12965,8 @@ packages:
+   mdn-data@2.27.1:
+     resolution: {integrity: sha512-9Yubnt3e8A0OKwxYSXyhLymGW4sCufcLG6VdiDdUGVkPhpqLxlvP5vl1983gQjJl3tqbrM731mjaZaP68AgosQ==}
+ 
+-  media-typer@1.1.0:
+-    resolution: {integrity: sha512-aisnrDP4GNe06UcKFnV5bfMNPBUw4jsLGaWwWfnH3v02GnBuXX2MCVn5RbrWo0j3pczUilYblq7fQ7Nw2t5XKw==}
++  media-typer@1.1.1:
++    resolution: {integrity: sha512-yz3xRaG20c6/BOzvYoDaGtPmGscs7YivItZEEqe6GbwNfHuxu9YNmvnEkMzKldAGY4/80pRcQRZSEnhquk9XuQ==}
+     engines: {node: '>= 0.8'}
+ 
+   merge-descriptors@2.0.0:
+@@ -18275,7 +18278,7 @@ snapshots:
+ 
+   mdn-data@2.27.1: {}
+ 
+-  media-typer@1.1.0: {}
++  media-typer@1.1.1: {}
+ 
+   merge-descriptors@2.0.0: {}
+ 
+@@ -19380,7 +19383,7 @@ snapshots:
+   type-is@2.1.0:
+     dependencies:
+       content-type: 2.0.0
+-      media-typer: 1.1.0
++      media-typer: 1.1.1
+       mime-types: 3.0.2
+ 
+   typebox@1.1.38: {}
+diff --git a/packages/client/ui-layout/src/client/locales.ts b/packages/client/ui-layout/src/client/locales.ts
+new file mode 100644
+index 0000000000..9f2da22768
+--- /dev/null
++++ b/packages/client/ui-layout/src/client/locales.ts
+@@ -0,0 +1,17 @@
++/** `layout` namespace dictionaries. */
++
++/** Dictionary namespace owned by the layout shell. */
++export const NS = 'layout'
++
++/** Simplified Chinese dictionary (the key-set source of truth). */
++export const zh = {
++  'split.close': '关闭分屏会话',
++} satisfies Record<string, string>
++
++/** Layout dictionary key union. */
++export type LayoutKey = keyof typeof zh
++
++/** English dictionary, checked complete against the Chinese source of truth. */
++export const en = {
++  'split.close': 'Close split session',
++} satisfies Record<LayoutKey, string>
+diff --git a/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.md b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.md
+new file mode 100644
+index 0000000000..241331e91f
+--- /dev/null
++++ b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.md
+@@ -0,0 +1,33 @@
++# Agent Note: Web conversation split view
++
++Status: implemented
++
++English | [中文](2026-08-14-web-conversation-split.zh.md)
++
++## Problem
++
++Comparing two conversations requires keeping one session's transcript visible while navigating another. The Web client staged only its selected session, so rendering an ordinary conversation slot a second time would still bind it to the primary session.
++
++## Decision
++
++The sidebar Session menu adds **Split session**. Selecting it calls `SessionRuntime.openInPane()` and `LayoutController.splitSession()`. The layout store retains one transient secondary `SessionId`; `AppFrame` renders the existing `conversation` slot a second time with that id in `RenderOpts.sessionId`.
++
++`SessionRuntime.paneProvideInfo(id)` resolves the secondary session's standard-kit bundle without changing the primary selection. The renderer propagates an addressed `sessionId` through the nested slot tree with `SessionBindingProvider`, so strict session slots, scoped inject factories, stores, input state, and conversation views read the selected secondary session. The Session object opens its history window and refreshes its direct subagent catalog before the pane is shown.
++
++The secondary pane has the same conversation implementation and controls as the primary pane, with an independent scrollport, per-session store, and input machine. It closes from the pane control or when the same session's menu action is chosen again. It is hidden below 920px and is not persisted across reload.
++
++## Alternatives considered
++
++**Duplicate the current conversation without an addressed bundle.** Rejected: both panes would bind to the current Session, which cannot compare two conversations and would share view state and input.
++
++**Create a second bespoke transcript component.** Rejected: a parallel renderer would duplicate slots, session state, chat views, tool cards, and future conversation contributions. The existing `conversation` slot supplies the same feature composition in both panes.
++
++**Persist the secondary selection.** Rejected: split layout is browser viewing state. Restoring a second history window on page load adds connection and resource work before the user asks for it.
++
++## Consequences
++
++The Web GUI presents a sidebar, primary conversation page, and selected secondary conversation page in a VS Code-style side-by-side layout. Each pane has its own transcript, active view, composer, and per-session store; primary navigation remains the global selection target.
++
++The renderer gains one addressed-session option for nested `renderSlot` calls. It is a renderer-local binding override, not a second global selection state. Sessions remain object-layer owners of event windows and standard-kit bundles.
++
++Focused layout, workspace-row, runtime, and renderer tests pin secondary selection, opening, binding, and teardown. The Web composition includes only existing client packages, so `pnpm run dev:web` rebuilds their bundles and the active client HMR receiver applies later browser-plugin edits without a page refresh.
+diff --git a/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.zh.md b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.zh.md
+new file mode 100644
+index 0000000000..00e77a8f67
+--- /dev/null
++++ b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.zh.md
+@@ -0,0 +1,33 @@
++# Agent Note: Web conversation split view
++
++Status: implemented
++
++[English](2026-08-14-web-conversation-split.md) | 中文
++
++## Problem
++
++比较两个对话需要在浏览另一个会话时保持其中一个会话的 transcript 可见。Web 客户端过去只 stage 当前选中的会话，因此第二次渲染普通 conversation slot 仍会绑定主会话。
++
++## Decision
++
++侧边栏 Session 菜单新增**分屏会话**。选择它会调用 `SessionRuntime.openInPane()` 和 `LayoutController.splitSession()`。layout store 保存一个瞬态的第二 `SessionId`；`AppFrame` 通过 `RenderOpts.sessionId` 第二次渲染已有 `conversation` slot。
++
++`SessionRuntime.paneProvideInfo(id)` 在不改变主选择的前提下解析第二会话的标准工具包。renderer 通过 `SessionBindingProvider` 在嵌套 slot 树中传递已寻址的 `sessionId`，所以严格 session slot、scoped inject factory、store、输入状态和 conversation view 都读取被选中的第二会话。窗格显示前，Session 会打开自己的历史窗口并刷新直属 subagent 目录。
++
++第二窗格使用与主窗格相同的会话实现和控制项，拥有独立的滚动区、逐会话 store 和输入机。点击窗格关闭控件，或再次选择同一会话的菜单项，都会关闭它。它在 920px 以下隐藏，页面刷新后不恢复。
++
++## Alternatives considered
++
++**不使用已寻址 bundle，直接复制当前 conversation。** 不采用：两个窗格都会绑定当前 Session，既不能比较两个对话，也会共享视图状态与输入。
++
++**创建第二套专用 transcript 组件。** 不采用：平行 renderer 会复制 slot、会话状态、聊天视图、工具卡片和未来的 conversation 贡献。已有 `conversation` slot 能在两个窗格中提供同一份功能组合。
++
++**持久化第二选择。** 不采用：分屏是浏览器查看状态。页面加载时恢复第二历史窗口会在用户请求前增加连接和资源开销。
++
++## Consequences
++
++Web GUI 呈现侧边栏、主会话页面以及选中的第二会话页面，形成类似 VS Code 的并排布局。每个窗格拥有自身的 transcript、活跃视图、composer 和逐会话 store；主导航仍是全局选择目标。
++
++renderer 为嵌套 `renderSlot` 调用新增一个已寻址 session 选项。它是 renderer 本地的绑定覆盖，不是第二份全局选择状态。Session 仍是事件窗口和标准工具包的对象层所有者。
++
++聚焦的 layout、workspace 行、runtime 与 renderer 测试覆盖第二选择、打开、绑定与释放。Web 组合只使用既有 client package，因此 `pnpm run dev:web` 会重建这些 bundle，已启用的客户端 HMR 接收器会在无需刷新页面的情况下应用后续浏览器插件修改。
+diff --git a/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.i18n.yaml b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.i18n.yaml
+new file mode 100644
+index 0000000000..885b271d8c
+--- /dev/null
++++ b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.i18n.yaml
+@@ -0,0 +1,6 @@
++# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
++# side as of the last confirmed-consistent state. Both languages carry equal authority;
++# after editing either side, bring the other along and re-record with:
++#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-08-14-web-conversation-split.md
++2026-08-14-web-conversation-split.md: 241331e91ff300743f9f5bbe0ef921ebe3cefe71
++2026-08-14-web-conversation-split.zh.md: 00e77a8f6733e08b6fab819cf48bad4ecfe66a72

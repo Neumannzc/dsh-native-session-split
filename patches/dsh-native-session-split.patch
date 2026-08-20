@@ -176,37 +176,61 @@ index 8846fba95b..4cad0f46c2 100644
      "@deepseek-ai/dsh-client-ui-slots": "workspace:^",
      "@deepseek-ai/dsh-client-ui-theme": "workspace:^",
 diff --git a/packages/client/ui-layout/src/client/AppFrame.module.css b/packages/client/ui-layout/src/client/AppFrame.module.css
-index ae56780133..98dbcc37ec 100644
+index ae56780133..797247c90d 100644
 --- a/packages/client/ui-layout/src/client/AppFrame.module.css
 +++ b/packages/client/ui-layout/src/client/AppFrame.module.css
-@@ -32,10 +32,45 @@
- .centerCol {
-   min-width: 0;
-   display: flex;
--  flex-direction: column;
+@@ -36,6 +36,70 @@
    overflow: hidden;
  }
  
++/* Keep the original single-conversation column intact unless a second pane is
++   actually visible. This prevents the extra flex item from changing the
++   native conversation root's height resolution in the ordinary one-pane UI. */
++.centerColSplit {
++  flex-direction: row;
++  min-height: 0;
++  height: 100%;
++}
++
 +.conversationPane {
 +  display: flex;
 +  flex: 1 1 0;
 +  min-width: 0;
++  min-height: 0;
++  height: 100%;
 +  overflow: hidden;
++}
++
++/* SlotOutlet's anchor is display:contents, so ConversationRoot is the actual
++   flex item in this pane. Give that native root the pane's full inline size
++   explicitly: an empty hero otherwise shrink-wraps to its composer, while a
++   populated chat happens to stretch it through its transcript. The same rule
++   lets full-bleed views such as Trajectory use the entire pane instead of
++   leaving a trailing blank strip. */
++.conversationPane > [data-slot='conversation'] > * {
++  flex: 1 1 auto;
++  min-width: 0;
++  width: 100%;
 +}
 +
 +.conversationPane + .conversationPane {
 +  border-left: 1px solid var(--dsw-alias-border-l2);
 +}
 +
++/* Reserve a narrow control rail instead of floating over the session header:
++   header action and utility slots are plugin extension points and may occupy
++   the upper-right corner. The rail keeps the close control reachable without
++   obscuring any native or third-party action. */
 +.conversationPane[data-conversation-pane='secondary'] {
-+  position: relative;
++  display: grid;
++  grid-template-columns: minmax(0, 1fr) 40px;
 +}
 +
 +.splitClose {
-+  position: absolute;
-+  z-index: 8;
-+  top: 12px;
-+  right: 12px;
++  grid-column: 2;
++  align-self: start;
++  justify-self: center;
++  margin-top: 12px;
 +  width: 24px;
 +  height: 24px;
 +  padding: 0;
@@ -227,7 +251,7 @@ index ae56780133..98dbcc37ec 100644
    min-width: 0;
    overflow: hidden;
 diff --git a/packages/client/ui-layout/src/client/AppFrame.tsx b/packages/client/ui-layout/src/client/AppFrame.tsx
-index 2696dc91fa..1e61ee7e94 100644
+index 2696dc91fa..3fd21af3ea 100644
 --- a/packages/client/ui-layout/src/client/AppFrame.tsx
 +++ b/packages/client/ui-layout/src/client/AppFrame.tsx
 @@ -12,7 +12,7 @@
@@ -239,14 +263,20 @@ index 2696dc91fa..1e61ee7e94 100644
  import { computeColumns, SIDEBAR_AUTO_COLLAPSE, SIDEBAR_DEFAULT } from './columns.ts'
  import type { createLayoutStore } from './stores.ts'
  import css from './AppFrame.module.css'
-@@ -22,6 +22,7 @@ export type AppFrameProps =
+@@ -22,10 +22,11 @@ export type AppFrameProps =
    & PropsRuntime<'root'>
    & PropsRenderSlots<'sidebar' | 'conversation' | 'details' | 'shell.overlay'>
    & PropsStore<ReturnType<typeof createLayoutStore>>
 +  & PropsLocale<'layout'>
  
  /** Center column grid item (session-body building block). */
- function CenterColumn(props: { children?: ReactNode }) {
+-function CenterColumn(props: { children?: ReactNode }) {
+-  return <div className={css.centerCol}>{props.children}</div>
++function CenterColumn(props: { split: boolean; children?: ReactNode }) {
++  return <div className={`${css.centerCol} ${props.split ? css.centerColSplit : ''}`}>{props.children}</div>
+ }
+ 
+ /** Details column grid item; width 0 keeps the subtree mounted (never unmount on close). */
 @@ -89,6 +90,7 @@ export function AppFrame({
    useSessions,
    actions,
@@ -263,29 +293,31 @@ index 2696dc91fa..1e61ee7e94 100644
    const colsRef = useRef(cols)
    colsRef.current = cols
  
-@@ -187,7 +190,25 @@ export function AppFrame({
+@@ -187,7 +190,27 @@ export function AppFrame({
              the shell's own pending rendering. The conversation
              is session-maybe; the strict details entry naturally renders
              empty while no session is current. */}
 -        <CenterColumn>{renderSlot('conversation', {})}</CenterColumn>
-+        <CenterColumn>
-+          <div className={css.conversationPane} data-conversation-pane="primary">
-+            {renderSlot('conversation', {})}
-+          </div>
-+          {splitVisible && panels.splitSessionId !== undefined && (
-+            <div className={css.conversationPane} data-conversation-pane="secondary">
-+              {renderSlot('conversation', {}, { sessionId: panels.splitSessionId })}
-+              <button
-+                type="button"
-+                className={css.splitClose}
-+                aria-label={t('split.close')}
-+                title={t('split.close')}
-+                onClick={actions.closeSplitSession}
-+              >
-+                ×
-+              </button>
-+            </div>
-+          )}
++        <CenterColumn split={splitVisible}>
++          {splitVisible && panels.splitSessionId !== undefined ? (
++            <>
++              <div className={css.conversationPane} data-conversation-pane="primary">
++                {renderSlot('conversation', {})}
++              </div>
++              <div className={css.conversationPane} data-conversation-pane="secondary">
++                {renderSlot('conversation', {}, { sessionId: panels.splitSessionId })}
++                <button
++                  type="button"
++                  className={css.splitClose}
++                  aria-label={t('split.close')}
++                  title={t('split.close')}
++                  onClick={actions.closeSplitSession}
++                >
++                  ×
++                </button>
++              </div>
++            </>
++          ) : renderSlot('conversation', {})}
 +        </CenterColumn>
          <DetailsColumn>{renderSlot('details', {})}</DetailsColumn>
        </>
@@ -445,7 +477,7 @@ index d2de668a9c..93a2037686 100644
        // untouched, so re-widening restores the pre-squeeze layout.
        toggleSidebar: (d) => {
 diff --git a/packages/client/ui-layout/tests/app-frame.client.spec.tsx b/packages/client/ui-layout/tests/app-frame.client.spec.tsx
-index 65de5a640e..8a55d5f1d8 100644
+index 65de5a640e..6934e239d9 100644
 --- a/packages/client/ui-layout/tests/app-frame.client.spec.tsx
 +++ b/packages/client/ui-layout/tests/app-frame.client.spec.tsx
 @@ -55,9 +55,9 @@ function hookOf<T>(inst: { subscribe: (fn: () => void) => () => void; getSnapsho
@@ -469,16 +501,34 @@ index 65de5a640e..8a55d5f1d8 100644
      />
    )
    const utils = render(element())
-@@ -163,6 +164,14 @@ describe('AppFrame', () => {
+@@ -163,6 +164,32 @@ describe('AppFrame', () => {
      expect(slotCalls.map(c => c.key)).toContain('conversation')
    })
  
++  it('keeps the native one-pane conversation tree in the ordinary layout', () => {
++    const { frame } = mountFrame()
++    expect(frame.querySelector('[data-conversation-pane="primary"]')).toBeNull()
++    expect(frame.querySelector('[data-testid="center-content"]')).not.toBeNull()
++  })
++
 +  it('mounts a primary and addressed secondary conversation when split is enabled', () => {
-+    const { instance, slotCalls } = mountFrame()
++    const { instance, slotCalls, frame } = mountFrame()
 +    act(() => { instance.actions.setSplitSession('s-secondary' as SessionId) })
 +    const panes = slotCalls.filter(call => call.key === 'conversation').slice(-2)
 +    expect(panes.map(call => call.props)).toEqual([{}, {}])
 +    expect(panes[1]?.sessionId).toBe('s-secondary')
++    const center = frame.querySelector('[data-conversation-pane="primary"]')?.parentElement
++    expect(center?.className).toContain('centerColSplit')
++  })
++
++  it('restores the native one-pane conversation tree when the split closes', () => {
++    const { instance, frame } = mountFrame()
++    act(() => { instance.actions.setSplitSession('s-secondary' as SessionId) })
++    expect(frame.querySelectorAll('[data-conversation-pane]').length).toBe(2)
++
++    act(() => { instance.actions.closeSplitSession() })
++    expect(frame.querySelectorAll('[data-conversation-pane]').length).toBe(0)
++    expect(frame.querySelector('[data-testid="center-content"]')).not.toBeNull()
 +  })
 +
    it('renders both column occupants before baselines settle (no loading gate)', () => {
@@ -669,6 +719,26 @@ index cdad4191ea..295195f618 100644
    }
    /** Workspace-side standard-kit sources. */
    workspaces: {
+diff --git a/packages/client/ui-trajectory/src/client/TrajectoryTable.module.css b/packages/client/ui-trajectory/src/client/TrajectoryTable.module.css
+index 71d0b3031b..3933ccbad6 100644
+--- a/packages/client/ui-trajectory/src/client/TrajectoryTable.module.css
++++ b/packages/client/ui-trajectory/src/client/TrajectoryTable.module.css
+@@ -874,6 +874,15 @@
+   background: var(--dsw-alias-bg-layer-1);
+ }
+ 
++/* A split conversation can be much narrower than the viewport. Do not reserve
++   most of that pane for the optional inspector: the ledger remains usable, and
++   selecting a new record can restore the inspector after the pane widens. */
++@container (max-width: 620px) {
++  .details {
++    display: none;
++  }
++}
++
+ .detailsResizeHandle {
+   position: absolute;
+   z-index: 6;
 diff --git a/packages/client/ui-workspace/README.i18n.yaml b/packages/client/ui-workspace/README.i18n.yaml
 index 6d5eff023b..3182a8ce09 100644
 --- a/packages/client/ui-workspace/README.i18n.yaml
@@ -1380,93 +1450,3 @@ index 0000000000..9f2da22768
 +export const en = {
 +  'split.close': 'Close split session',
 +} satisfies Record<LayoutKey, string>
-diff --git a/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.md b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.md
-new file mode 100644
-index 0000000000..241331e91f
---- /dev/null
-+++ b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.md
-@@ -0,0 +1,33 @@
-+# Agent Note: Web conversation split view
-+
-+Status: implemented
-+
-+English | [中文](2026-08-14-web-conversation-split.zh.md)
-+
-+## Problem
-+
-+Comparing two conversations requires keeping one session's transcript visible while navigating another. The Web client staged only its selected session, so rendering an ordinary conversation slot a second time would still bind it to the primary session.
-+
-+## Decision
-+
-+The sidebar Session menu adds **Split session**. Selecting it calls `SessionRuntime.openInPane()` and `LayoutController.splitSession()`. The layout store retains one transient secondary `SessionId`; `AppFrame` renders the existing `conversation` slot a second time with that id in `RenderOpts.sessionId`.
-+
-+`SessionRuntime.paneProvideInfo(id)` resolves the secondary session's standard-kit bundle without changing the primary selection. The renderer propagates an addressed `sessionId` through the nested slot tree with `SessionBindingProvider`, so strict session slots, scoped inject factories, stores, input state, and conversation views read the selected secondary session. The Session object opens its history window and refreshes its direct subagent catalog before the pane is shown.
-+
-+The secondary pane has the same conversation implementation and controls as the primary pane, with an independent scrollport, per-session store, and input machine. It closes from the pane control or when the same session's menu action is chosen again. It is hidden below 920px and is not persisted across reload.
-+
-+## Alternatives considered
-+
-+**Duplicate the current conversation without an addressed bundle.** Rejected: both panes would bind to the current Session, which cannot compare two conversations and would share view state and input.
-+
-+**Create a second bespoke transcript component.** Rejected: a parallel renderer would duplicate slots, session state, chat views, tool cards, and future conversation contributions. The existing `conversation` slot supplies the same feature composition in both panes.
-+
-+**Persist the secondary selection.** Rejected: split layout is browser viewing state. Restoring a second history window on page load adds connection and resource work before the user asks for it.
-+
-+## Consequences
-+
-+The Web GUI presents a sidebar, primary conversation page, and selected secondary conversation page in a VS Code-style side-by-side layout. Each pane has its own transcript, active view, composer, and per-session store; primary navigation remains the global selection target.
-+
-+The renderer gains one addressed-session option for nested `renderSlot` calls. It is a renderer-local binding override, not a second global selection state. Sessions remain object-layer owners of event windows and standard-kit bundles.
-+
-+Focused layout, workspace-row, runtime, and renderer tests pin secondary selection, opening, binding, and teardown. The Web composition includes only existing client packages, so `pnpm run dev:web` rebuilds their bundles and the active client HMR receiver applies later browser-plugin edits without a page refresh.
-diff --git a/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.zh.md b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.zh.md
-new file mode 100644
-index 0000000000..00e77a8f67
---- /dev/null
-+++ b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.zh.md
-@@ -0,0 +1,33 @@
-+# Agent Note: Web conversation split view
-+
-+Status: implemented
-+
-+[English](2026-08-14-web-conversation-split.md) | 中文
-+
-+## Problem
-+
-+比较两个对话需要在浏览另一个会话时保持其中一个会话的 transcript 可见。Web 客户端过去只 stage 当前选中的会话，因此第二次渲染普通 conversation slot 仍会绑定主会话。
-+
-+## Decision
-+
-+侧边栏 Session 菜单新增**分屏会话**。选择它会调用 `SessionRuntime.openInPane()` 和 `LayoutController.splitSession()`。layout store 保存一个瞬态的第二 `SessionId`；`AppFrame` 通过 `RenderOpts.sessionId` 第二次渲染已有 `conversation` slot。
-+
-+`SessionRuntime.paneProvideInfo(id)` 在不改变主选择的前提下解析第二会话的标准工具包。renderer 通过 `SessionBindingProvider` 在嵌套 slot 树中传递已寻址的 `sessionId`，所以严格 session slot、scoped inject factory、store、输入状态和 conversation view 都读取被选中的第二会话。窗格显示前，Session 会打开自己的历史窗口并刷新直属 subagent 目录。
-+
-+第二窗格使用与主窗格相同的会话实现和控制项，拥有独立的滚动区、逐会话 store 和输入机。点击窗格关闭控件，或再次选择同一会话的菜单项，都会关闭它。它在 920px 以下隐藏，页面刷新后不恢复。
-+
-+## Alternatives considered
-+
-+**不使用已寻址 bundle，直接复制当前 conversation。** 不采用：两个窗格都会绑定当前 Session，既不能比较两个对话，也会共享视图状态与输入。
-+
-+**创建第二套专用 transcript 组件。** 不采用：平行 renderer 会复制 slot、会话状态、聊天视图、工具卡片和未来的 conversation 贡献。已有 `conversation` slot 能在两个窗格中提供同一份功能组合。
-+
-+**持久化第二选择。** 不采用：分屏是浏览器查看状态。页面加载时恢复第二历史窗口会在用户请求前增加连接和资源开销。
-+
-+## Consequences
-+
-+Web GUI 呈现侧边栏、主会话页面以及选中的第二会话页面，形成类似 VS Code 的并排布局。每个窗格拥有自身的 transcript、活跃视图、composer 和逐会话 store；主导航仍是全局选择目标。
-+
-+renderer 为嵌套 `renderSlot` 调用新增一个已寻址 session 选项。它是 renderer 本地的绑定覆盖，不是第二份全局选择状态。Session 仍是事件窗口和标准工具包的对象层所有者。
-+
-+聚焦的 layout、workspace 行、runtime 与 renderer 测试覆盖第二选择、打开、绑定与释放。Web 组合只使用既有 client package，因此 `pnpm run dev:web` 会重建这些 bundle，已启用的客户端 HMR 接收器会在无需刷新页面的情况下应用后续浏览器插件修改。
-diff --git a/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.i18n.yaml b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.i18n.yaml
-new file mode 100644
-index 0000000000..885b271d8c
---- /dev/null
-+++ b/.agents/notes/implemented/feature/2026-08-14-web-conversation-split.i18n.yaml
-@@ -0,0 +1,6 @@
-+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-+# side as of the last confirmed-consistent state. Both languages carry equal authority;
-+# after editing either side, bring the other along and re-record with:
-+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-08-14-web-conversation-split.md
-+2026-08-14-web-conversation-split.md: 241331e91ff300743f9f5bbe0ef921ebe3cefe71
-+2026-08-14-web-conversation-split.zh.md: 00e77a8f6733e08b6fab819cf48bad4ecfe66a72
